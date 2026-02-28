@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="rshunterbtt"
+description="Rust Hunter BTT MQTT/BLE Bridge"
+command="/root/rshunterbtt/rshunterbtt"
+command_background="yes"
+directory="/root/rshunterbtt"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/rshunterbtt.log"
+error_log="/var/log/rshunterbtt.log"
+
+export RUST_LOG=info
+
+depend() {
+    need dbus bluetooth
+    after net
+}

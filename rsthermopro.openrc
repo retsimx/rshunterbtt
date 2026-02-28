@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="rsthermopro"
+description="Rust ThermoPro Passive BLE Scanner"
+command="/root/rsthermopro/rsthermopro"
+command_background="yes"
+directory="/root/rsthermopro"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/rsthermopro.log"
+error_log="/var/log/rsthermopro.log"
+
+export RUST_LOG=info
+
+depend() {
+    need dbus bluetooth
+    after net
+}
