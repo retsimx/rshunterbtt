@@ -197,7 +197,7 @@ pub async fn run_app() -> Result<()> {
 async fn run_app_instance() -> Result<()> {
     let config = Config::from_env()?;
     
-    let ble_client = Arc::new(crate::ble::BtleplugClient::new());
+    let ble_client = Arc::new(crate::ble::BtleplugClient::new().await?);
     
     let (mqtt_client_impl, mut eventloop) = crate::mqtt::RumqttcClient::new(
         &config.mqtt_broker,

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, Characteristic, WriteType};
-use btleplug::platform::{Manager, Peripheral};
+use btleplug::platform::{Manager, Peripheral, Adapter};
 use uuid::Uuid;
 use std::time::Duration;
 use tokio::time;
@@ -11,14 +11,19 @@ use crate::traits::BleClient;
 use crate::protocol::{Second83Protocol, Second86Protocol, protocol_id_to_uuid, BATTERY_LEVEL_CHAR_UUID};
 
 pub struct BtleplugClient {
+    central: Adapter,
     peripheral: tokio::sync::Mutex<Option<Peripheral>>,
 }
 
 impl BtleplugClient {
-    pub fn new() -> Self {
-        Self {
+    pub async fn new() -> Result<Self> {
+        let manager = Manager::new().await?;
+        let adapters = manager.adapters().await?;
+        let central = adapters.into_iter().next().ok_or_else(|| anyhow!("No adapters found"))?;
+        Ok(Self {
+            central,
             peripheral: tokio::sync::Mutex::new(None),
-        }
+        })
     }
 
     async fn get_peripheral(&self) -> Result<Peripheral> {
@@ -41,14 +46,11 @@ impl BtleplugClient {
 #[async_trait]
 impl BleClient for BtleplugClient {
     async fn connect(&self, address: &str) -> Result<()> {
-        let manager = Manager::new().await?;
-        let adapters = manager.adapters().await?;
-        let central = adapters.into_iter().next().ok_or_else(|| anyhow!("No adapters found"))?;
-
-        central.start_scan(ScanFilter::default()).await?;
+        info!("Starting BLE scan for {}...", address);
+        self.central.start_scan(ScanFilter::default()).await?;
         time::sleep(Duration::from_secs(2)).await;
 
-        for p in central.peripherals().await? {
+        for p in self.central.peripherals().await? {
             if p.address().to_string() == address {
                 info!("Found device {}, connecting...", address);
                 p.connect().await?;
