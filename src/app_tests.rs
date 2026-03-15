@@ -154,4 +154,28 @@ mod tests {
 
         app.poll_battery().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_poll_battery_failure() {
+        let mut ble = MockBleClient::new();
+        let mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        // Simulate connection failure
+        ble.expect_is_connected().returning(|| Box::pin(async { false }));
+        ble.expect_connect()
+            .with(eq("11:22:33:44:55:66"))
+            .returning(|_| Box::pin(async { Err(anyhow::anyhow!("Connection timed out")) }));
+
+        let app = App::new(
+            mock_config(),
+            Arc::new(ble),
+            Arc::new(mqtt),
+            Arc::new(db),
+        );
+
+        let result = app.poll_battery().await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "Connection timed out");
+    }
 }

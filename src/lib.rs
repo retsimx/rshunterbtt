@@ -219,10 +219,15 @@ async fn run_app_instance() -> Result<()> {
     let app_clone = app.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(e) = app_clone.poll_battery().await {
-                error!("Battery poll failed: {}", e);
+            match app_clone.poll_battery().await {
+                Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+                Err(e) => {
+                    error!("Battery poll failed: {}. Retrying in 60s...", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     });
 
