@@ -47,12 +47,28 @@ impl BtleplugClient {
 impl BleClient for BtleplugClient {
     async fn connect(&self, address: &str) -> Result<()> {
         info!("Starting BLE scan for {}...", address);
-        self.central.start_scan(ScanFilter::default()).await?;
-        time::sleep(Duration::from_secs(2)).await;
+        match self.central.start_scan(ScanFilter::default()).await {
+            Ok(_) => debug!("Scan started successfully"),
+            Err(e) => {
+                let err_msg = format!("{:?}", e);
+                if err_msg.contains("AlreadyInProgress") || err_msg.contains("already in progress") || err_msg.contains("Operation already in progress") {
+                    info!("BLE scan already in progress (matched: {}), continuing to search...", err_msg);
+                } else {
+                    return Err(anyhow!("Scan error: {}", err_msg));
+                }
+            }
+        }
+        
+        time::sleep(Duration::from_secs(10)).await;
 
-        for p in self.central.peripherals().await? {
+        let peripherals = self.central.peripherals().await?;
+        for p in peripherals {
             if p.address().to_string() == address {
                 info!("Found device {}, connecting...", address);
+                
+                // Try to stop scanning before connecting if we were the ones who started it
+                let _ = self.central.stop_scan().await;
+                
                 p.connect().await?;
                 info!("Connected to {}. Discovering services...", address);
                 p.discover_services().await?;
