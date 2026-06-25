@@ -9,8 +9,11 @@ pub mod database;
 mod app_tests;
 
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, error};
 use anyhow::{Result, anyhow};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::traits::{BleClient, MqttClient, DatabaseWriter};
@@ -182,6 +185,80 @@ impl App {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BatteryPollingIntervals {
+    pub success: Duration,
+    pub failure: Duration,
+}
+
+impl BatteryPollingIntervals {
+    pub const PRODUCTION: Self = Self {
+        success: Duration::from_secs(3600),
+        failure: Duration::from_secs(60),
+    };
+}
+
+pub(crate) async fn run_battery_polling_loop(
+    app: Arc<App>,
+    mut shutdown: watch::Receiver<bool>,
+    intervals: BatteryPollingIntervals,
+) {
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        match app.poll_battery().await {
+            Ok(_) => {
+                if wait_for_next_poll(&mut shutdown, intervals.success).await {
+                    break;
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Battery poll failed: {}. Retrying in {}s...",
+                    e,
+                    intervals.failure.as_secs()
+                );
+                if wait_for_next_poll(&mut shutdown, intervals.failure).await {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_next_poll(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        _ = tokio::time::sleep(duration) => *shutdown.borrow(),
+    }
+}
+
+pub(crate) struct BatteryPollingGuard {
+    stop_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl BatteryPollingGuard {
+    pub(crate) fn start(app: Arc<App>, intervals: BatteryPollingIntervals) -> Self {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_battery_polling_loop(app, stop_rx, intervals));
+        Self { stop_tx, task }
+    }
+}
+
+impl Drop for BatteryPollingGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        self.task.abort();
+    }
+}
+
 pub async fn run_app() -> Result<()> {
     tracing_subscriber::fmt::init();
     
@@ -215,21 +292,7 @@ async fn run_app_instance() -> Result<()> {
 
     let app = Arc::new(App::new(config.clone(), ble_client, mqtt_client.clone(), db_writer));
 
-    // Start battery polling task
-    let app_clone = app.clone();
-    tokio::spawn(async move {
-        loop {
-            match app_clone.poll_battery().await {
-                Ok(_) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                }
-                Err(e) => {
-                    error!("Battery poll failed: {}. Retrying in 60s...", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                }
-            }
-        }
-    });
+    let _battery_polling = BatteryPollingGuard::start(app.clone(), BatteryPollingIntervals::PRODUCTION);
 
     // Subscribe to MQTT topic
     info!("Subscribing to MQTT topic: {}", config.mqtt_sub_topic);

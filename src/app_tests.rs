@@ -4,9 +4,13 @@ mod tests {
     use crate::traits::{MockBleClient, MockMqttClient, MockDatabaseWriter};
     use crate::config::Config;
     use crate::protocol::Second83Protocol;
+    use crate::{BatteryPollingGuard, BatteryPollingIntervals, run_battery_polling_loop};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use mockall::predicate::*;
     use mockall::predicate;
+    use tokio::sync::watch;
 
     fn mock_config() -> Config {
         Config {
@@ -177,5 +181,92 @@ mod tests {
         let result = app.poll_battery().await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "Connection timed out");
+    }
+
+    fn test_battery_polling_intervals() -> BatteryPollingIntervals {
+        BatteryPollingIntervals {
+            success: Duration::from_millis(50),
+            failure: Duration::from_millis(10),
+        }
+    }
+
+    fn mock_app_with_battery_counter(poll_count: Arc<AtomicUsize>) -> Arc<App> {
+        let mut ble = MockBleClient::new();
+        let mqtt = MockMqttClient::new();
+        let mut db = MockDatabaseWriter::new();
+
+        ble.expect_is_connected().returning(|| Box::pin(async { true }));
+
+        let count_for_read = poll_count.clone();
+        ble.expect_read_battery().returning(move || {
+            let count = count_for_read.clone();
+            Box::pin(async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(85)
+            })
+        });
+
+        db.expect_write_battery()
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        Arc::new(App::new(
+            mock_config(),
+            Arc::new(ble),
+            Arc::new(mqtt),
+            Arc::new(db),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_uncancelled_battery_tasks_accumulate_polls() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let app = mock_app_with_battery_counter(poll_count.clone());
+        let intervals = test_battery_polling_intervals();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+
+        tokio::spawn(run_battery_polling_loop(
+            app.clone(),
+            stop_rx.clone(),
+            intervals,
+        ));
+        tokio::spawn(run_battery_polling_loop(app, stop_rx, intervals));
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        assert!(
+            poll_count.load(Ordering::SeqCst) > 2,
+            "expected multiple uncancelled loops to accumulate polls, got {}",
+            poll_count.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_battery_polling_does_not_accumulate_on_instance_restart() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let app = mock_app_with_battery_counter(poll_count.clone());
+        let intervals = test_battery_polling_intervals();
+
+        {
+            let _guard = BatteryPollingGuard::start(app.clone(), intervals);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            poll_count.load(Ordering::SeqCst),
+            1,
+            "stopped instance should not keep polling"
+        );
+
+        {
+            let _guard = BatteryPollingGuard::start(app.clone(), intervals);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            poll_count.load(Ordering::SeqCst),
+            2,
+            "restarted instance should add exactly one new poller"
+        );
     }
 }
