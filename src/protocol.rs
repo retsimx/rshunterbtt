@@ -131,6 +131,28 @@ impl Second83Protocol {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Second82Protocol {
+    pub enabled: bool,
+    pub suspend_watering: bool,
+    pub zone1_state: bool,
+    pub zone2_state: bool,
+}
+
+impl Second82Protocol {
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < 14 {
+            return Err(anyhow!("Data too short for Second82Protocol"));
+        }
+        Ok(Self {
+            enabled: data[0] != 0,
+            suspend_watering: data[1] != 0,
+            zone1_state: data[10] != 0,
+            zone2_state: data[11] != 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +179,36 @@ mod tests {
     fn test_second86_short_data() {
         let data = vec![0; 16];
         assert!(Second86Protocol::from_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn test_second82_short_data() {
+        let data = vec![0; 13];
+        assert!(Second82Protocol::from_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn test_second82_offset_correctness() {
+        let mut data = vec![0; 14];
+        data[4] = 1;
+        data[8] = 1;
+        data[10] = 0;
+        data[11] = 1;
+        let parsed = Second82Protocol::from_bytes(&data).unwrap();
+        assert!(!parsed.zone1_state);
+        assert!(parsed.zone2_state);
+    }
+
+    #[test]
+    fn test_second82_enabled_and_suspend_flags() {
+        let mut data = vec![0; 14];
+        data[0] = 1;
+        data[1] = 1;
+        let parsed = Second82Protocol::from_bytes(&data).unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.suspend_watering);
+        assert!(!parsed.zone1_state);
+        assert!(!parsed.zone2_state);
     }
 
     #[test]

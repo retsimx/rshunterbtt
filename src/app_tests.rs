@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Config;
-    use crate::protocol::Second83Protocol;
+    use crate::protocol::{Second82Protocol, Second83Protocol};
     use crate::traits::{MockBleClient, MockDatabaseWriter, MockMqttClient};
     use crate::App;
     use crate::{
@@ -10,6 +10,7 @@ mod tests {
     };
     use mockall::predicate;
     use mockall::predicate::*;
+    use mockall::PredicateBooleanExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -95,7 +96,7 @@ mod tests {
         ble.expect_read_status().returning(|| {
             Box::pin(async {
                 let mut data = vec![0; 20];
-                data[8] = 1; // Zone 2 active
+                data[11] = 1; // Zone 2 active (byte 11)
                 Ok(data)
             })
         });
@@ -116,17 +117,172 @@ mod tests {
         ble.expect_read_status().returning(|| {
             Box::pin(async {
                 let mut data = vec![0; 20];
-                data[4] = 1; // Zone 1 active
+                data[10] = 1; // Zone 1 active (byte 10)
+                data[1] = 1; // suspend_watering
                 Ok(data)
             })
         });
 
         mqtt.expect_publish()
-            .with(eq("pub"), predicate::str::contains(r#""status":1"#))
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""status":1"#)
+                    .and(predicate::str::contains(r#""suspend_watering":true"#)),
+            )
             .returning(|_, _| Box::pin(async { Ok(()) }));
 
         let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
         let payload = r#"{"cmd":"status","zone":"flower"}"#; // flower is zone 1
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_status_uses_cached_notification_without_reread() {
+        let ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        // No read_status expectation is set: if get_status issues a GATT read,
+        // mockall will panic on the unexpected call, proving no re-read happens.
+
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""status":1"#)
+                    .and(predicate::str::contains(r#""suspend_watering":true"#)),
+            )
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db))
+            .with_status_cache(status_rx, status_tx.clone());
+
+        // Inject an ff82 notification with a changed zone state directly into the
+        // watch cache (as the notification-consumer task would).
+        let mut data = vec![0u8; 14];
+        data[1] = 1; // suspend_watering (byte 1)
+        data[10] = 1; // zone1 active (byte 10)
+        let parsed = Second82Protocol::from_bytes(&data).unwrap();
+        status_tx.send(Some(parsed)).unwrap();
+
+        let payload = r#"{"cmd":"status","zone":"flower"}"#; // flower is zone 1
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_notification_consumer_updates_status_cache() {
+        let ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        // No read_status expectation: the notification, not a GATT read, must
+        // serve the status (mockall panics on unexpected calls).
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""status":1"#)
+                    .and(predicate::str::contains(r#""suspend_watering":true"#)),
+            )
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, mut status_rx) = watch::channel(None);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (notif_tx, notif_rx) = tokio::sync::mpsc::channel(1);
+        crate::spawn_notification_consumer(notif_rx, status_tx.clone(), shutdown_rx);
+
+        let mut data = vec![0u8; 14];
+        data[1] = 1; // suspend_watering (byte 1)
+        data[10] = 1; // zone1 active (byte 10)
+        notif_tx.send(data).await.unwrap();
+        status_rx.changed().await.unwrap();
+
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db))
+            .with_status_cache(status_rx, status_tx);
+
+        let payload = r#"{"cmd":"status","zone":"flower"}"#; // flower is zone 1
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_status_seed_read_on_connect() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        // Cache is None right after connect (no notification yet), so exactly ONE
+        // seed GATT read must occur. times(1) makes any second read a failure.
+        ble.expect_read_status().times(1).returning(|| {
+            Box::pin(async {
+                let mut data = vec![0; 20];
+                data[10] = 1; // zone1 active (byte 10)
+                data[1] = 1; // suspend_watering (byte 1)
+                Ok(data)
+            })
+        });
+
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""status":1"#)
+                    .and(predicate::str::contains(r#""suspend_watering":true"#)),
+            )
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
+
+        let payload = r#"{"cmd":"status","zone":"flower"}"#; // flower is zone 1
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_status_response_includes_suspend_watering() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        // byte 1 = 0 in the seed read -> suspend_watering must be false.
+        ble.expect_read_status()
+            .times(1)
+            .returning(|| Box::pin(async { Ok(vec![0; 20]) }));
+
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""suspend_watering":false"#),
+            )
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
+
+        let payload = r#"{"cmd":"status","zone":"flower"}"#;
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_on_off_response_has_no_suspend_watering() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        ble.expect_read_protocol_83()
+            .returning(|| Box::pin(async { Ok(Second83Protocol::default()) }));
+        ble.expect_read_status()
+            .returning(|| Box::pin(async { Ok(vec![0; 20]) }));
+        ble.expect_write_protocol_83()
+            .withf(|p| p.zone1_enable_manual == 0)
+            .returning(|_| Box::pin(async { Ok(()) }));
+
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""success":true"#)
+                    .and(predicate::str::contains("suspend_watering").not()),
+            )
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
+
+        let payload = r#"{"cmd":"on_off","zone":"flower","on_off":false}"#;
         app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
     }
 
@@ -394,6 +550,7 @@ mod tests {
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = watch::channel(false);
+        let (status_tx, _status_rx) = watch::channel(None);
         let ready_check = ready_rx.clone();
 
         let app = Arc::new(
@@ -408,6 +565,7 @@ mod tests {
             supervisor_config,
             stop_rx,
             ready_tx,
+            status_tx,
         ));
 
         wait_until(|| connect_count.load(Ordering::SeqCst) >= 1 && *ready_check.borrow()).await;
