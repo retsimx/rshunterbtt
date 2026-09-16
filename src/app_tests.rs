@@ -175,6 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_battery_failure_when_connection_not_ready() {
+        tokio::time::pause();
         let ble = MockBleClient::new();
         let mqtt = MockMqttClient::new();
         let db = MockDatabaseWriter::new();
@@ -183,15 +184,43 @@ mod tests {
         let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db))
             .with_connection_ready(ready_rx);
 
-        // The connection never becomes ready; ensure_connection_ready must fail.
+        // The connection never becomes ready; ensure_connection_ready must wait
+        // through intermediate false updates and then time out.
         let ready_tx2 = ready_tx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             let _ = ready_tx2.send(false);
         });
 
-        let result = app.poll_battery().await;
+        let fut = app.poll_battery();
+        tokio::pin!(fut);
+        tokio::time::advance(Duration::from_secs(70)).await;
+        let result = fut.await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_connection_ready_waits_for_recovery() {
+        let ble = MockBleClient::new();
+        let mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db))
+            .with_connection_ready(ready_rx);
+
+        // Send an intermediate false, then true. The gate must not return on the
+        // false; it must wait until the connection becomes ready.
+        let ready_tx2 = ready_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = ready_tx2.send(false);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = ready_tx2.send(true);
+        });
+
+        let result = app.ensure_connection_ready().await;
+        assert!(result.is_ok());
     }
 
     fn test_battery_polling_intervals() -> BatteryPollingIntervals {

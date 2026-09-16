@@ -185,7 +185,7 @@ impl BleClient for BtleplugClient {
         let char = self
             .find_characteristic(&p, "0000ff81-0000-1000-8000-00805f9b34fb")
             .await?;
-        debug!("Writing password: {}", hex::encode(password));
+        debug!("Writing password to ff81");
         p.write(&char, password, WriteType::WithResponse)
             .await
             .map_err(|e| anyhow!(e))

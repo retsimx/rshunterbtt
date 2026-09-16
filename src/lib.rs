@@ -79,16 +79,23 @@ impl App {
             return Ok(());
         }
         let mut rx = self.connection_ready.clone();
-        tokio::select! {
-            _ = rx.changed() => {
-                if *rx.borrow() {
-                    Ok(())
-                } else {
-                    Err(anyhow!("BLE connection not ready"))
-                }
+        let deadline = tokio::time::Instant::now() + CONNECTION_READY_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "Timed out waiting for BLE connection to become ready"
+                ));
             }
-            _ = tokio::time::sleep(CONNECTION_READY_TIMEOUT) => {
-                Err(anyhow!("Timed out waiting for BLE connection to become ready"))
+            tokio::select! {
+                _ = rx.changed() => {
+                    if *rx.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    return Err(anyhow!("Timed out waiting for BLE connection to become ready"));
+                }
             }
         }
     }
