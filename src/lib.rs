@@ -177,7 +177,14 @@ impl App {
             None => {
                 let status_data = self.ble_client.read_status().await?;
                 let parsed = Second82Protocol::from_bytes(&status_data)?;
-                let _ = self.status_tx.send(Some(parsed.clone()));
+                self.status_tx.send_if_modified(|current| {
+                    if current.is_none() {
+                        *current = Some(parsed.clone());
+                        true
+                    } else {
+                        false
+                    }
+                });
                 parsed
             }
         };
@@ -431,8 +438,8 @@ pub(crate) async fn run_connection_supervisor(
         match run_connection_setup(&ble_client, &config).await {
             Ok(notif_rx) => {
                 backoff = INITIAL_BACKOFF;
-                let _ = ready_tx.send(true);
                 let _ = status_tx.send(None);
+                let _ = ready_tx.send(true);
                 spawn_notification_consumer(notif_rx, status_tx.clone(), shutdown.clone());
                 if wait_for_disconnect_or_shutdown(&mut shutdown, &ble_client).await {
                     break;

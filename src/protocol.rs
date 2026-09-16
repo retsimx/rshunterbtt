@@ -195,8 +195,20 @@ mod tests {
         data[10] = 0;
         data[11] = 1;
         let parsed = Second82Protocol::from_bytes(&data).unwrap();
-        assert_eq!(parsed.zone1_state, false);
-        assert_eq!(parsed.zone2_state, true);
+        assert!(!parsed.zone1_state);
+        assert!(parsed.zone2_state);
+    }
+
+    #[test]
+    fn test_second82_enabled_and_suspend_flags() {
+        let mut data = vec![0; 14];
+        data[0] = 1;
+        data[1] = 1;
+        let parsed = Second82Protocol::from_bytes(&data).unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.suspend_watering);
+        assert!(!parsed.zone1_state);
+        assert!(!parsed.zone2_state);
     }
 
     #[test]
