@@ -1,6 +1,6 @@
-use async_trait::async_trait;
-use anyhow::Result;
 use crate::protocol::{Second83Protocol, Second86Protocol};
+use anyhow::Result;
+use async_trait::async_trait;
 
 #[cfg(any(test, feature = "mockall"))]
 use mockall::automock;
@@ -16,6 +16,11 @@ pub trait BleClient: Send + Sync {
     async fn write_protocol_86(&self, data: &Second86Protocol) -> Result<()>;
     async fn write_protocol_8b(&self, data: &Second86Protocol) -> Result<()>;
     async fn read_battery(&self) -> Result<u8>;
+    async fn write_password(&self, password: &[u8; 4]) -> Result<()>;
+    async fn subscribe_notifications(
+        &self,
+        uuid_str: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<Vec<u8>>>;
 }
 
 #[async_trait]

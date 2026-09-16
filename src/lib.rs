@@ -1,23 +1,24 @@
+pub mod ble;
 pub mod config;
+pub mod database;
+pub mod hci;
+pub mod mqtt;
 pub mod protocol;
 pub mod traits;
-pub mod ble;
-pub mod mqtt;
-pub mod database;
 
 #[cfg(test)]
 mod app_tests;
 
+use crate::config::Config;
+use crate::protocol::Second86Protocol;
+use crate::traits::{BleClient, DatabaseWriter, MqttClient};
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, error};
-use anyhow::{Result, anyhow};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use serde::{Deserialize, Serialize};
-use crate::config::Config;
-use crate::traits::{BleClient, MqttClient, DatabaseWriter};
-use crate::protocol::Second86Protocol;
+use tracing::{error, info, warn};
 
 #[derive(Debug, Deserialize)]
 pub struct MqttCommand {
@@ -48,6 +49,7 @@ pub struct App {
     pub ble_client: Arc<dyn BleClient>,
     pub mqtt_client: Arc<dyn MqttClient>,
     pub db_writer: Arc<dyn DatabaseWriter>,
+    connection_ready: watch::Receiver<bool>,
 }
 
 impl App {
@@ -57,20 +59,54 @@ impl App {
         mqtt_client: Arc<dyn MqttClient>,
         db_writer: Arc<dyn DatabaseWriter>,
     ) -> Self {
+        let (_, ready_rx) = watch::channel(true);
         Self {
             config,
             ble_client,
             mqtt_client,
             db_writer,
+            connection_ready: ready_rx,
+        }
+    }
+
+    pub fn with_connection_ready(mut self, connection_ready: watch::Receiver<bool>) -> Self {
+        self.connection_ready = connection_ready;
+        self
+    }
+
+    async fn ensure_connection_ready(&self) -> Result<()> {
+        if *self.connection_ready.borrow() {
+            return Ok(());
+        }
+        let mut rx = self.connection_ready.clone();
+        let deadline = tokio::time::Instant::now() + CONNECTION_READY_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "Timed out waiting for BLE connection to become ready"
+                ));
+            }
+            tokio::select! {
+                _ = rx.changed() => {
+                    if *rx.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    return Err(anyhow!("Timed out waiting for BLE connection to become ready"));
+                }
+            }
         }
     }
 
     pub async fn run_command(&self, cmd: &str, zone: u8, run_time_secs: u32) -> Result<bool> {
-        info!("Running command: {} for zone {} ({}s)", cmd, zone, run_time_secs);
-        
-        if !self.ble_client.is_connected().await {
-            self.ble_client.connect(&self.config.device_address).await?;
-        }
+        info!(
+            "Running command: {} for zone {} ({}s)",
+            cmd, zone, run_time_secs
+        );
+
+        self.ensure_connection_ready().await?;
 
         let mut prot83 = self.ble_client.read_protocol_83().await?;
         let _status_data = self.ble_client.read_status().await?;
@@ -116,9 +152,7 @@ impl App {
     }
 
     pub async fn get_status(&self, zone: u8) -> Result<bool> {
-        if !self.ble_client.is_connected().await {
-            self.ble_client.connect(&self.config.device_address).await?;
-        }
+        self.ensure_connection_ready().await?;
         let status_data = self.ble_client.read_status().await?;
         if zone == 1 {
             Ok(status_data.get(4).cloned().unwrap_or(0) != 0)
@@ -165,21 +199,25 @@ impl App {
         }
 
         let resp_payload = serde_json::to_string(&response)?;
-        info!("Publishing response to {}: {}", self.config.mqtt_pub_topic, resp_payload);
-        self.mqtt_client.publish(&self.config.mqtt_pub_topic, &resp_payload).await?;
+        info!(
+            "Publishing response to {}: {}",
+            self.config.mqtt_pub_topic, resp_payload
+        );
+        self.mqtt_client
+            .publish(&self.config.mqtt_pub_topic, &resp_payload)
+            .await?;
 
         Ok(())
     }
 
     pub async fn poll_battery(&self) -> Result<()> {
         info!("Polling battery level for {}...", self.config.device_name);
-        if !self.ble_client.is_connected().await {
-            info!("BLE not connected, connecting to {}...", self.config.device_address);
-            self.ble_client.connect(&self.config.device_address).await?;
-        }
+        self.ensure_connection_ready().await?;
         let level = self.ble_client.read_battery().await?;
         info!("Battery level: {}%", level);
-        self.db_writer.write_battery(&self.config.device_name, level).await?;
+        self.db_writer
+            .write_battery(&self.config.device_name, level)
+            .await?;
         info!("Battery level successfully written to database.");
         Ok(())
     }
@@ -210,7 +248,7 @@ pub(crate) async fn run_battery_polling_loop(
 
         match app.poll_battery().await {
             Ok(_) => {
-                if wait_for_next_poll(&mut shutdown, intervals.success).await {
+                if wait_for_shutdown_or_timeout(&mut shutdown, intervals.success).await {
                     break;
                 }
             }
@@ -220,7 +258,7 @@ pub(crate) async fn run_battery_polling_loop(
                     e,
                     intervals.failure.as_secs()
                 );
-                if wait_for_next_poll(&mut shutdown, intervals.failure).await {
+                if wait_for_shutdown_or_timeout(&mut shutdown, intervals.failure).await {
                     break;
                 }
             }
@@ -228,7 +266,10 @@ pub(crate) async fn run_battery_polling_loop(
     }
 }
 
-async fn wait_for_next_poll(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+async fn wait_for_shutdown_or_timeout(
+    shutdown: &mut watch::Receiver<bool>,
+    duration: Duration,
+) -> bool {
     if *shutdown.borrow() {
         return true;
     }
@@ -259,9 +300,149 @@ impl Drop for BatteryPollingGuard {
     }
 }
 
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(65);
+
+fn next_backoff(current: Duration) -> Duration {
+    let doubled = current.saturating_mul(2);
+    if doubled > MAX_BACKOFF {
+        MAX_BACKOFF
+    } else {
+        doubled
+    }
+}
+
+fn build_password(password: Option<&str>) -> [u8; 4] {
+    let mut buf = [0u8; 4];
+    match password {
+        Some(p) => {
+            let bytes = p.as_bytes();
+            let n = bytes.len().min(4);
+            buf[..n].copy_from_slice(&bytes[..n]);
+        }
+        None => {
+            info!("DEVICE_PASSWORD not set; using default password [0x00,0x00,0x00,0x00]");
+        }
+    }
+    buf
+}
+
+async fn run_connection_setup(ble_client: &Arc<dyn BleClient>, config: &Config) -> Result<()> {
+    info!(
+        "Connection attempt: connecting to {}...",
+        config.device_address
+    );
+    ble_client.connect(&config.device_address).await?;
+    info!("Connection established with {}.", config.device_address);
+
+    if let Err(e) = crate::hci::request_4000ms_interval(&config.device_address) {
+        warn!("Failed to request 4000ms connection interval: {}", e);
+    }
+
+    let password = build_password(config.device_password.as_deref());
+    info!("Writing password to ff81...");
+    ble_client.write_password(&password).await?;
+    info!("Password write succeeded.");
+
+    info!("Subscribing to ff82 notifications...");
+    // Receiver intentionally dropped for now; notifications are not yet consumed (deferred to H-2 #3).
+    let _rx = ble_client
+        .subscribe_notifications("0000ff82-0000-1000-8000-00805f9b34fb")
+        .await?;
+    info!("Subscribed to ff82 notifications.");
+
+    Ok(())
+}
+
+async fn wait_for_disconnect_or_shutdown(
+    shutdown: &mut watch::Receiver<bool>,
+    ble_client: &Arc<dyn BleClient>,
+) -> bool {
+    loop {
+        if *shutdown.borrow() {
+            return true;
+        }
+        if !ble_client.is_connected().await {
+            info!("BLE connection lost; re-running connection setup");
+            return false;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return true;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+pub(crate) async fn run_connection_supervisor(
+    ble_client: Arc<dyn BleClient>,
+    config: Config,
+    mut shutdown: watch::Receiver<bool>,
+    ready_tx: watch::Sender<bool>,
+) {
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        match run_connection_setup(&ble_client, &config).await {
+            Ok(()) => {
+                backoff = INITIAL_BACKOFF;
+                let _ = ready_tx.send(true);
+                if wait_for_disconnect_or_shutdown(&mut shutdown, &ble_client).await {
+                    break;
+                }
+                let _ = ready_tx.send(false);
+            }
+            Err(e) => {
+                error!(
+                    "Connection setup failed: {}. Retrying in {}s...",
+                    e,
+                    backoff.as_secs()
+                );
+                let _ = ready_tx.send(false);
+                if wait_for_shutdown_or_timeout(&mut shutdown, backoff).await {
+                    break;
+                }
+                backoff = next_backoff(backoff);
+            }
+        }
+    }
+}
+
+pub(crate) struct ConnectionGuard {
+    stop_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl ConnectionGuard {
+    pub(crate) fn start(
+        ble_client: Arc<dyn BleClient>,
+        config: Config,
+    ) -> (Self, watch::Receiver<bool>) {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let task = tokio::spawn(run_connection_supervisor(
+            ble_client, config, stop_rx, ready_tx,
+        ));
+        (Self { stop_tx, task }, ready_rx)
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        self.task.abort();
+    }
+}
+
 pub async fn run_app() -> Result<()> {
     tracing_subscriber::fmt::init();
-    
+
     loop {
         info!("Starting rshunterbtt...");
         if let Err(e) = run_app_instance().await {
@@ -273,26 +454,36 @@ pub async fn run_app() -> Result<()> {
 
 async fn run_app_instance() -> Result<()> {
     let config = Config::from_env()?;
-    
+
     let ble_client = Arc::new(crate::ble::BtleplugClient::new().await?);
-    
+
     let (mqtt_client_impl, mut eventloop) = crate::mqtt::RumqttcClient::new(
         &config.mqtt_broker,
         config.mqtt_port,
-        &format!("rshunterbtt-{}", config.device_name)
+        &format!("rshunterbtt-{}", config.device_name),
     );
     let mqtt_client = Arc::new(mqtt_client_impl);
-    
+
     let db_writer = Arc::new(crate::database::InfluxDbWriter::new(
         &config.influxdb_url,
         &config.influxdb_token,
         &config.influxdb_org,
-        &config.influxdb_bucket
+        &config.influxdb_bucket,
     ));
 
-    let app = Arc::new(App::new(config.clone(), ble_client, mqtt_client.clone(), db_writer));
+    let app = App::new(
+        config.clone(),
+        ble_client.clone(),
+        mqtt_client.clone(),
+        db_writer,
+    );
 
-    let _battery_polling = BatteryPollingGuard::start(app.clone(), BatteryPollingIntervals::PRODUCTION);
+    let (connection_guard, connection_ready) = ConnectionGuard::start(ble_client, config.clone());
+    let app = Arc::new(app.with_connection_ready(connection_ready));
+
+    let _battery_polling =
+        BatteryPollingGuard::start(app.clone(), BatteryPollingIntervals::PRODUCTION);
+    let _connection = connection_guard;
 
     // Subscribe to MQTT topic
     info!("Subscribing to MQTT topic: {}", config.mqtt_sub_topic);
@@ -314,7 +505,10 @@ async fn run_app_instance() -> Result<()> {
                 }
             }
             Err(e) => {
-                error!("MQTT loop error: {}. Returning to supervisor for restart...", e);
+                error!(
+                    "MQTT loop error: {}. Returning to supervisor for restart...",
+                    e
+                );
                 return Err(anyhow!("MQTT EventLoop error: {}", e));
             }
         }

@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-use anyhow::Result;
-use influxdb::{Client, WriteQuery};
 use crate::traits::DatabaseWriter;
+use anyhow::Result;
+use async_trait::async_trait;
+use influxdb::{Client, WriteQuery};
 
 pub struct InfluxDbWriter {
     client: Client,
@@ -10,9 +10,7 @@ pub struct InfluxDbWriter {
 impl InfluxDbWriter {
     pub fn new(url: &str, token: &str, _org: &str, bucket: &str) -> Self {
         let client = Client::new(url, bucket).with_token(token);
-        Self {
-            client,
-        }
+        Self { client }
     }
 }
 
@@ -22,8 +20,11 @@ impl DatabaseWriter for InfluxDbWriter {
         let query = WriteQuery::new(chrono::Utc::now().into(), "battery")
             .add_tag("name", device_name)
             .add_field("battery", level as i64);
-        
-        self.client.query(query).await.map_err(|e| anyhow::anyhow!(e))?;
+
+        self.client
+            .query(query)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
 }

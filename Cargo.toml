@@ -20,6 +20,8 @@ uuid = "1.0"
 dbus = { version = "0.9", features = ["vendored"] }
 mockall = { version = "0.13", optional = true }
 hex = "0.4"
+futures = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 mockall = "0.13"

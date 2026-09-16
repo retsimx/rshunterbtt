@@ -1,7 +1,7 @@
-use anyhow::{Result, anyhow};
+use crate::traits::MqttClient;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
-use crate::traits::MqttClient;
 
 pub struct RumqttcClient {
     client: AsyncClient,
@@ -20,10 +20,16 @@ impl RumqttcClient {
 #[async_trait]
 impl MqttClient for RumqttcClient {
     async fn publish(&self, topic: &str, payload: &str) -> Result<()> {
-        self.client.publish(topic, QoS::AtLeastOnce, false, payload.as_bytes()).await.map_err(|e| anyhow!(e))
+        self.client
+            .publish(topic, QoS::AtLeastOnce, false, payload.as_bytes())
+            .await
+            .map_err(|e| anyhow!(e))
     }
 
     async fn subscribe(&self, topic: &str) -> Result<()> {
-        self.client.subscribe(topic, QoS::AtLeastOnce).await.map_err(|e| anyhow!(e))
+        self.client
+            .subscribe(topic, QoS::AtLeastOnce)
+            .await
+            .map_err(|e| anyhow!(e))
     }
 }
