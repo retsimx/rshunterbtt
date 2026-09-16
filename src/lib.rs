@@ -10,7 +10,7 @@ pub mod traits;
 mod app_tests;
 
 use crate::config::Config;
-use crate::protocol::Second86Protocol;
+use crate::protocol::{Second82Protocol, Second86Protocol};
 use crate::traits::{BleClient, DatabaseWriter, MqttClient};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+pub(crate) type StatusCache = watch::Receiver<Option<Second82Protocol>>;
+pub(crate) type StatusCacheSender = watch::Sender<Option<Second82Protocol>>;
 
 #[derive(Debug, Deserialize)]
 pub struct MqttCommand {
@@ -50,6 +53,8 @@ pub struct App {
     pub mqtt_client: Arc<dyn MqttClient>,
     pub db_writer: Arc<dyn DatabaseWriter>,
     connection_ready: watch::Receiver<bool>,
+    status_cache: StatusCache,
+    status_tx: StatusCacheSender,
 }
 
 impl App {
@@ -60,17 +65,30 @@ impl App {
         db_writer: Arc<dyn DatabaseWriter>,
     ) -> Self {
         let (_, ready_rx) = watch::channel(true);
+        let (status_tx, status_rx) = watch::channel(None);
         Self {
             config,
             ble_client,
             mqtt_client,
             db_writer,
             connection_ready: ready_rx,
+            status_cache: status_rx,
+            status_tx,
         }
     }
 
     pub fn with_connection_ready(mut self, connection_ready: watch::Receiver<bool>) -> Self {
         self.connection_ready = connection_ready;
+        self
+    }
+
+    pub fn with_status_cache(
+        mut self,
+        status_cache: StatusCache,
+        status_tx: StatusCacheSender,
+    ) -> Self {
+        self.status_cache = status_cache;
+        self.status_tx = status_tx;
         self
     }
 
@@ -153,11 +171,20 @@ impl App {
 
     pub async fn get_status(&self, zone: u8) -> Result<bool> {
         self.ensure_connection_ready().await?;
-        let status_data = self.ble_client.read_status().await?;
+        let cached = self.status_cache.borrow().clone();
+        let protocol = match cached {
+            Some(p) => p,
+            None => {
+                let status_data = self.ble_client.read_status().await?;
+                let parsed = Second82Protocol::from_bytes(&status_data)?;
+                let _ = self.status_tx.send(Some(parsed.clone()));
+                parsed
+            }
+        };
         if zone == 1 {
-            Ok(status_data.get(4).cloned().unwrap_or(0) != 0)
+            Ok(protocol.zone1_state)
         } else {
-            Ok(status_data.get(8).cloned().unwrap_or(0) != 0)
+            Ok(protocol.zone2_state)
         }
     }
 
@@ -191,6 +218,15 @@ impl App {
             "status" => {
                 let status = self.get_status(zone_id).await?;
                 response.status = Some(if status { 1 } else { 0 });
+                let suspend = self
+                    .status_cache
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.suspend_watering)
+                    .unwrap_or(false);
+                if let Some(obj) = response.extra.as_object_mut() {
+                    obj.insert("suspend_watering".to_string(), serde_json::json!(suspend));
+                }
             }
             _ => {
                 error!("Unknown command: {}", msg.cmd);
@@ -328,7 +364,10 @@ fn build_password(password: Option<&str>) -> [u8; 4] {
     buf
 }
 
-async fn run_connection_setup(ble_client: &Arc<dyn BleClient>, config: &Config) -> Result<()> {
+async fn run_connection_setup(
+    ble_client: &Arc<dyn BleClient>,
+    config: &Config,
+) -> Result<tokio::sync::mpsc::Receiver<Vec<u8>>> {
     info!(
         "Connection attempt: connecting to {}...",
         config.device_address
@@ -346,13 +385,12 @@ async fn run_connection_setup(ble_client: &Arc<dyn BleClient>, config: &Config) 
     info!("Password write succeeded.");
 
     info!("Subscribing to ff82 notifications...");
-    // Receiver intentionally dropped for now; notifications are not yet consumed (deferred to H-2 #3).
-    let _rx = ble_client
+    let rx = ble_client
         .subscribe_notifications("0000ff82-0000-1000-8000-00805f9b34fb")
         .await?;
     info!("Subscribed to ff82 notifications.");
 
-    Ok(())
+    Ok(rx)
 }
 
 async fn wait_for_disconnect_or_shutdown(
@@ -383,6 +421,7 @@ pub(crate) async fn run_connection_supervisor(
     config: Config,
     mut shutdown: watch::Receiver<bool>,
     ready_tx: watch::Sender<bool>,
+    status_tx: StatusCacheSender,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
@@ -390,9 +429,11 @@ pub(crate) async fn run_connection_supervisor(
             break;
         }
         match run_connection_setup(&ble_client, &config).await {
-            Ok(()) => {
+            Ok(notif_rx) => {
                 backoff = INITIAL_BACKOFF;
                 let _ = ready_tx.send(true);
+                let _ = status_tx.send(None);
+                spawn_notification_consumer(notif_rx, status_tx.clone(), shutdown.clone());
                 if wait_for_disconnect_or_shutdown(&mut shutdown, &ble_client).await {
                     break;
                 }
@@ -414,6 +455,39 @@ pub(crate) async fn run_connection_supervisor(
     }
 }
 
+fn spawn_notification_consumer(
+    mut notif_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    status_tx: StatusCacheSender,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                payload = notif_rx.recv() => {
+                    match payload {
+                        Some(data) => {
+                            match Second82Protocol::from_bytes(&data) {
+                                Ok(parsed) => {
+                                    let _ = status_tx.send(Some(parsed));
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse ff82 notification: {}", e);
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 pub(crate) struct ConnectionGuard {
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
@@ -423,13 +497,18 @@ impl ConnectionGuard {
     pub(crate) fn start(
         ble_client: Arc<dyn BleClient>,
         config: Config,
-    ) -> (Self, watch::Receiver<bool>) {
+    ) -> (Self, watch::Receiver<bool>, StatusCache, StatusCacheSender) {
         let (stop_tx, stop_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = watch::channel(false);
+        let (status_tx, status_rx) = watch::channel(None);
         let task = tokio::spawn(run_connection_supervisor(
-            ble_client, config, stop_rx, ready_tx,
+            ble_client,
+            config,
+            stop_rx,
+            ready_tx,
+            status_tx.clone(),
         ));
-        (Self { stop_tx, task }, ready_rx)
+        (Self { stop_tx, task }, ready_rx, status_rx, status_tx)
     }
 }
 
@@ -478,8 +557,12 @@ async fn run_app_instance() -> Result<()> {
         db_writer,
     );
 
-    let (connection_guard, connection_ready) = ConnectionGuard::start(ble_client, config.clone());
-    let app = Arc::new(app.with_connection_ready(connection_ready));
+    let (connection_guard, connection_ready, status_cache, status_tx) =
+        ConnectionGuard::start(ble_client, config.clone());
+    let app = Arc::new(
+        app.with_connection_ready(connection_ready)
+            .with_status_cache(status_cache, status_tx),
+    );
 
     let _battery_polling =
         BatteryPollingGuard::start(app.clone(), BatteryPollingIntervals::PRODUCTION);
