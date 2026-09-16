@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 pub const BATTERY_LEVEL_CHAR_UUID: &str = "00002a19-0000-1000-8000-00805f9b34fb";
 
@@ -55,10 +55,23 @@ impl Second86Protocol {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         vec![
-            self.w_index, self.ztm_type, self.ztm_days, self.ztm_interval1, self.ztm_interval2,
-            self.ztm_odd_or_even, self.zcm_type, self.zcm_days, self.zcm_interval1,
-            self.zcm_interval2, self.zcm_odd_or_even, self.zm_hour, self.zm_minute,
-            self.zm_second, self.zem_hour, self.zem_minute, self.zem_second,
+            self.w_index,
+            self.ztm_type,
+            self.ztm_days,
+            self.ztm_interval1,
+            self.ztm_interval2,
+            self.ztm_odd_or_even,
+            self.zcm_type,
+            self.zcm_days,
+            self.zcm_interval1,
+            self.zcm_interval2,
+            self.zcm_odd_or_even,
+            self.zm_hour,
+            self.zm_minute,
+            self.zm_second,
+            self.zem_hour,
+            self.zem_minute,
+            self.zem_second,
         ]
     }
 }
@@ -102,9 +115,17 @@ impl Second83Protocol {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         vec![
-            self.enabled, self.suspend_watering, self.zone1_enabled, self.zone1_mode,
-            self.zone1_enable_manual, self.zone2_enabled, self.zone2_mode,
-            self.zone2_enable_manual, self.run_all_hh, self.run_all_mm, self.run_all_ss,
+            self.enabled,
+            self.suspend_watering,
+            self.zone1_enabled,
+            self.zone1_mode,
+            self.zone1_enable_manual,
+            self.zone2_enabled,
+            self.zone2_mode,
+            self.zone2_enable_manual,
+            self.run_all_hh,
+            self.run_all_mm,
+            self.run_all_ss,
             self.special_setting,
         ]
     }
@@ -116,8 +137,14 @@ mod tests {
 
     #[test]
     fn test_protocol_id_to_uuid() {
-        assert_eq!(protocol_id_to_uuid(0xff80), "0000ff80-0000-1000-8000-00805f9b34fb");
-        assert_eq!(protocol_id_to_uuid(65411), "0000ff83-0000-1000-8000-00805f9b34fb");
+        assert_eq!(
+            protocol_id_to_uuid(0xff80),
+            "0000ff80-0000-1000-8000-00805f9b34fb"
+        );
+        assert_eq!(
+            protocol_id_to_uuid(65411),
+            "0000ff83-0000-1000-8000-00805f9b34fb"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
+use anyhow::{Context, Result};
 use serde::Deserialize;
-use anyhow::{Result, Context};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -13,12 +13,13 @@ pub struct Config {
     pub influxdb_token: String,
     pub influxdb_org: String,
     pub influxdb_bucket: String,
+    pub device_password: Option<String>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
-        
+
         let config = Config {
             device_address: std::env::var("DEVICE_ADDRESS").context("DEVICE_ADDRESS not set")?,
             device_name: std::env::var("DEVICE_NAME").context("DEVICE_NAME not set")?,
@@ -33,8 +34,9 @@ impl Config {
             influxdb_token: std::env::var("INFLUXDB_TOKEN").context("INFLUXDB_TOKEN not set")?,
             influxdb_org: std::env::var("INFLUXDB_ORG").context("INFLUXDB_ORG not set")?,
             influxdb_bucket: std::env::var("INFLUXDB_BUCKET").context("INFLUXDB_BUCKET not set")?,
+            device_password: std::env::var("DEVICE_PASSWORD").ok(),
         };
-        
+
         Ok(config)
     }
 }

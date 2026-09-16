@@ -30,6 +30,7 @@ Configuration is managed via a `.env` file in the working directory:
 # BLE Configuration
 DEVICE_ADDRESS=18:04:ED:53:6D:20
 DEVICE_NAME=rear
+# DEVICE_PASSWORD=<plain ASCII string, up to 4 characters>
 
 # MQTT Configuration
 MQTT_BROKER=10.0.21.245
@@ -43,6 +44,21 @@ INFLUXDB_TOKEN=your_token_here
 INFLUXDB_ORG=home
 INFLUXDB_BUCKET=sprinkler
 ```
+
+### Device Password (`DEVICE_PASSWORD`)
+
+The device password is a plain ASCII string of up to 4 characters. On
+connect, the bridge writes it to characteristic `ff81` as raw bytes:
+the password's bytes are copied into a fixed 4-byte buffer at index 0
+for `min(4, len)` bytes, zero-padded right (or truncated) to 4 bytes.
+No hex-encoding, null-termination, or length prefix is used (OEM
+parity).
+
+If `DEVICE_PASSWORD` is unset, the bridge uses the default
+`[0x00, 0x00, 0x00, 0x00]`. This is an **assumption, not a verified
+OEM default** — a repo-wide search of decompiled OEM sources found no
+hardcoded factory-default password. If your device requires a password,
+set `DEVICE_PASSWORD` explicitly.
 
 ## MQTT Interface
 
@@ -71,6 +87,35 @@ cross build --target arm-unknown-linux-musleabihf --release
 ```
 
 ## Deployment
+
+### Required host BLE configuration (one-time)
+
+The bridge requests a **4000ms** connection interval at runtime via a
+pure-Rust HCI connection-parameter update (an `LE Connection Update`
+command sent over a raw HCI socket) — no external tools required. This is
+necessary because BlueZ's central-role connection otherwise uses the
+peripheral's advertised preferred parameters (100–200ms), not the
+`main.conf` defaults.
+
+In addition, configuring the BlueZ default connection parameters in
+`/etc/bluetooth/main.conf` is **recommended** as a fallback default. Add
+the following to the `[LE]` section:
+
+```ini
+[LE]
+MinConnectionInterval=3200
+MaxConnectionInterval=3200
+ConnectionLatency=0
+ConnectionSupervisionTimeout=2000
+```
+
+Units: the interval fields are in ×1.25ms steps (`3200 × 1.25ms =
+4000ms`); the supervision timeout is in ×10ms steps (`2000 × 10ms =
+20000ms`, above the mandatory floor of `2×(1+latency)×interval =
+8000ms` and within the 32000ms ceiling).
+
+Apply the change with `rc-service bluetooth restart` (Alpine/OpenRC
+hosts — no systemd) or a host reboot.
 
 1. Copy the cross-compiled binary to `/root/rshunterbtt/rshunterbtt`.
 2. Create `/root/rshunterbtt/.env` with the correct device settings.
