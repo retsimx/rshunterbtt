@@ -104,7 +104,7 @@ mod tests {
         ble.expect_read_status().returning(|| {
             Box::pin(async {
                 let mut data = vec![0; 20];
-                data[11] = 1; // Zone 2 active (byte 11)
+                data[11] = 5; // Zone 2 watering (byte 11, state 5)
                 Ok(data)
             })
         });
@@ -125,7 +125,7 @@ mod tests {
         ble.expect_read_status().returning(|| {
             Box::pin(async {
                 let mut data = vec![0; 20];
-                data[10] = 1; // Zone 1 active (byte 10)
+                data[10] = 5; // Zone 1 watering (byte 10, state 5)
                 data[1] = 1; // suspend_watering
                 Ok(data)
             })
@@ -169,7 +169,7 @@ mod tests {
         // watch cache (as the notification-consumer task would).
         let mut data = vec![0u8; 14];
         data[1] = 1; // suspend_watering (byte 1)
-        data[10] = 1; // zone1 active (byte 10)
+        data[10] = 5; // zone1 watering (byte 10, state 5 = command-started)
         let parsed = Second82Protocol::from_bytes(&data).unwrap();
         status_tx.send(Some(parsed)).unwrap();
 
@@ -200,7 +200,7 @@ mod tests {
 
         let mut data = vec![0u8; 14];
         data[1] = 1; // suspend_watering (byte 1)
-        data[10] = 1; // zone1 active (byte 10)
+        data[10] = 5; // zone1 watering (byte 10, state 5)
         notif_tx.send(data).await.unwrap();
         status_rx.changed().await.unwrap();
 
@@ -222,7 +222,7 @@ mod tests {
         ble.expect_read_status().times(1).returning(|| {
             Box::pin(async {
                 let mut data = vec![0; 20];
-                data[10] = 1; // zone1 active (byte 10)
+                data[10] = 5; // zone1 watering (byte 10, state 5)
                 data[1] = 1; // suspend_watering (byte 1)
                 Ok(data)
             })
@@ -1016,8 +1016,8 @@ mod tests {
 
     fn valve_event_protocol(zone1: bool, zone2: bool) -> Second82Protocol {
         let mut data = vec![0u8; 14];
-        data[10] = zone1 as u8;
-        data[11] = zone2 as u8;
+        data[10] = if zone1 { 5 } else { 1 }; // 5 = watering, 1 = idle
+        data[11] = if zone2 { 5 } else { 1 };
         Second82Protocol::from_bytes(&data).unwrap()
     }
 

@@ -149,6 +149,25 @@ pub struct Second82Protocol {
     pub zone2_state: bool,
 }
 
+/// ff82 zone-state byte values (ground truth: the OEM app's status handling,
+/// confirmed by live button-press probes):
+///
+/// | Value | Meaning |
+/// |---|---|
+/// | 0 | standby / off |
+/// | 1 | idle / monitoring (normal) |
+/// | 2 | scheduled-watering reminder (not watering) |
+/// | 5 | watering (command-started) |
+/// | 9 | watering (ext-manual-started) |
+/// | 17 (0x11) | watering (manual button) |
+///
+/// The state is an enum, NOT a boolean: only `5`, `9`, `17` mean the zone is
+/// actually watering. `1` (idle) and `2` (scheduled reminder) must NOT be
+/// treated as "on".
+fn zone_state_is_on(state: u8) -> bool {
+    matches!(state, 5 | 9 | 17)
+}
+
 impl Second82Protocol {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 14 {
@@ -157,8 +176,8 @@ impl Second82Protocol {
         Ok(Self {
             enabled: data[0] != 0,
             suspend_watering: data[1] != 0,
-            zone1_state: data[10] != 0,
-            zone2_state: data[11] != 0,
+            zone1_state: zone_state_is_on(data[10]),
+            zone2_state: zone_state_is_on(data[11]),
         })
     }
 }
@@ -206,7 +225,28 @@ mod tests {
         data[11] = 1;
         let parsed = Second82Protocol::from_bytes(&data).unwrap();
         assert!(!parsed.zone1_state);
-        assert!(parsed.zone2_state);
+        assert!(!parsed.zone2_state);
+    }
+
+    #[test]
+    fn test_second82_zone_state_enum() {
+        // State is an enum, not a boolean: only 5/9/17 mean watering.
+        for on in [5u8, 9, 17] {
+            let mut data = vec![0; 14];
+            data[10] = on;
+            data[11] = on;
+            let parsed = Second82Protocol::from_bytes(&data).unwrap();
+            assert!(parsed.zone1_state, "state {} should be on", on);
+            assert!(parsed.zone2_state, "state {} should be on", on);
+        }
+        for off in [0u8, 1, 2] {
+            let mut data = vec![0; 14];
+            data[10] = off;
+            data[11] = off;
+            let parsed = Second82Protocol::from_bytes(&data).unwrap();
+            assert!(!parsed.zone1_state, "state {} should be off", off);
+            assert!(!parsed.zone2_state, "state {} should be off", off);
+        }
     }
 
     #[test]
