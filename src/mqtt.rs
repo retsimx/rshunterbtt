@@ -10,7 +10,11 @@ pub struct RumqttcClient {
 impl RumqttcClient {
     pub fn new(host: &str, port: u16, client_id: &str) -> (Self, rumqttc::EventLoop) {
         let mut mqttoptions = MqttOptions::new(client_id, host, port);
-        mqttoptions.set_keep_alive(std::time::Duration::from_secs(5));
+        // 60s keepalive (broker tolerates 1.5x = 90s). A short keepalive (the
+        // previous 5s) is missed while the single-core Pi Zero W is busy with a
+        // BLE connect/scan, so the broker closes the connection and the bridge
+        // enters a crash loop.
+        mqttoptions.set_keep_alive(std::time::Duration::from_secs(60));
 
         let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
         (Self { client }, eventloop)
