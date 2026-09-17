@@ -315,7 +315,11 @@ mod tests {
             .returning(|_| Box::pin(async { Ok(()) }));
 
         mqtt.expect_publish()
-            .with(eq("pub"), predicate::str::contains(r#""success":true"#))
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""success":true"#)
+                    .and(predicate::str::contains("duration_seconds").not()),
+            )
             .returning(|_, _| Box::pin(async { Ok(()) }));
 
         let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));

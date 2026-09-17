@@ -244,11 +244,21 @@ impl App {
                         let duration = msg
                             .duration_seconds
                             .unwrap_or(self.config.default_run_seconds);
-                        self.run_command("start", zone_id, duration)
-                            .await
-                            .unwrap_or(false)
+                        match self.run_command("start", zone_id, duration).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("Failed to start zone {}: {:#}", zone_id, e);
+                                false
+                            }
+                        }
                     } else {
-                        self.run_command("stop", zone_id, 0).await.unwrap_or(false)
+                        match self.run_command("stop", zone_id, 0).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("Failed to stop zone {}: {:#}", zone_id, e);
+                                false
+                            }
+                        }
                     };
                     response.success = Some(success);
                 }

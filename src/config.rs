@@ -83,4 +83,12 @@ mod tests {
         let config = Config::from_env().unwrap();
         assert_eq!(config.default_run_seconds, 1800);
     }
+
+    #[test]
+    fn default_run_seconds_fails_when_invalid() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("DEFAULT_RUN_SECONDS", "not_a_number");
+        assert!(Config::from_env().is_err());
+    }
 }
