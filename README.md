@@ -43,7 +43,11 @@ MQTT_PUB_TOPIC=irrigation/c2s/rear
 
 # BLE connection interval (ms; 8-4000, default 4000). Lower = faster MQTT
 # command turnaround but more radio connection events (battery drain).
-# Empirical: 60ms -> ~0.5s commands, 1000ms -> ~5s, 4000ms -> ~21s.
+# Empirical: 60ms -> ~0.5s commands, 1000ms -> ~5s, 4000ms -> ~21s. The
+# Hunter BTT peripheral re-negotiates back to ~48-60ms; the bridge's interval
+# guard (HCI monitor) detects and re-applies this value. Keep
+# /etc/bluetooth/main.conf [LE] Min/MaxConnectionInterval in sync
+# (interval_ms * 0.8).
 # CONN_INTERVAL_MS=1000
 
 # InfluxDB Configuration

@@ -90,23 +90,32 @@ impl IntervalGuard {
         (self.interval_ms as u32 * 4 / 5) as u16
     }
 
+    /// Decide whether a reported interval warrants a corrective re-apply:
+    /// off-target and outside the rate-limit window. Records the attempt time.
+    fn should_reapply(&mut self, actual_units: u16) -> bool {
+        if actual_units == self.target_units() {
+            return false;
+        }
+        if self.last_reapply.elapsed() < REAPPLY_MIN_GAP {
+            return false;
+        }
+        self.last_reapply = Instant::now();
+        true
+    }
+
     /// The peripheral (or BlueZ) has re-negotiated the interval away from our
     /// target. Re-assert it, rate-limited. The re-apply runs on its own thread
     /// so a slow/blocking `request_interval` never stalls the monitor loop
     /// (which would otherwise drop events).
     fn enforce(&mut self, actual_units: u16) {
-        if actual_units == self.target_units() {
-            return;
-        }
         let actual_ms = actual_units as u32 * 5 / 4;
-        if self.last_reapply.elapsed() < REAPPLY_MIN_GAP {
+        if !self.should_reapply(actual_units) {
             debug!(
-                "interval changed to {}ms (target {}ms) within rate-limit window; not re-applying yet",
+                "interval now {}ms (target {}ms); not re-applying",
                 actual_ms, self.interval_ms
             );
             return;
         }
-        self.last_reapply = Instant::now();
         let device_address = self.device_address.clone();
         let interval_ms = self.interval_ms;
         info!(
@@ -132,9 +141,6 @@ fn decode_monitor_packet(data: &[u8], guard: &mut IntervalGuard) {
     let opcode = u16::from_le_bytes([data[0], data[1]]);
     let len = u16::from_le_bytes([data[4], data[5]]) as usize;
     debug!("monitor frame: opcode={} len={}", opcode, len);
-    if std::env::var("RSHUNTERBTT_MON_DEBUG").is_ok() {
-        info!("monitor raw: {:02x?}", &data[..data.len().min(24)]);
-    }
     if data.len() < HCI_MON_HDR_SIZE + len {
         return;
     }
@@ -289,5 +295,33 @@ mod tests {
             0x3eu8, 0x0c, 0x03, 0x00, 0x40, 0x00, 0x30, 0x00, 0x00, 0x00, 0xd0, 0x07,
         ];
         decode_monitor_packet(&event_pkt(&evt), &mut g);
+    }
+
+    #[test]
+    fn test_should_reapply_only_when_off_target_and_outside_rate_limit() {
+        let mut g = IntervalGuard::new("11:22:33:44:55:66".to_string(), 1000);
+        let target_units = 800; // 1000ms
+        assert!(
+            !g.should_reapply(target_units),
+            "on-target interval must not trigger a re-apply"
+        );
+        assert!(
+            g.should_reapply(48),
+            "off-target interval must trigger a re-apply"
+        );
+        assert!(
+            !g.should_reapply(60),
+            "a second revert inside the rate-limit window must be deferred"
+        );
+    }
+
+    #[test]
+    fn test_target_units_conversion() {
+        let g = IntervalGuard::new("x".to_string(), 1000);
+        assert_eq!(g.target_units(), 800); // 1000ms / 1.25
+        let g = IntervalGuard::new("x".to_string(), 4000);
+        assert_eq!(g.target_units(), 3200);
+        let g = IntervalGuard::new("x".to_string(), 60);
+        assert_eq!(g.target_units(), 48);
     }
 }
