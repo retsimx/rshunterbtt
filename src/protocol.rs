@@ -274,4 +274,10 @@ mod tests {
         data[..9].copy_from_slice(b"Back Yard");
         assert_eq!(decode_zone_name(&data).unwrap(), "Back Yard");
     }
+
+    #[test]
+    fn test_decode_zone_name_invalid_utf8() {
+        let data = b"\xff\xfe\x00";
+        assert!(decode_zone_name(data).is_err());
+    }
 }

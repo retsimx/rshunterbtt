@@ -257,8 +257,10 @@ impl App {
                     obj.insert("suspend_watering".to_string(), serde_json::json!(suspend));
                 }
                 let zone_names = self.zone_names.borrow().clone();
-                if let Some(names) = zone_names {
-                    if let Some(obj) = response.extra.as_object_mut() {
+                if let Some(obj) = response.extra.as_object_mut() {
+                    obj.remove("zone1_name");
+                    obj.remove("zone2_name");
+                    if let Some(names) = zone_names {
                         if let Some(name) = names.zone1 {
                             obj.insert("zone1_name".to_string(), serde_json::json!(name));
                         }
@@ -536,16 +538,22 @@ pub(crate) async fn run_connection_supervisor(
                 ladder.on_connection_success();
                 backoff = INITIAL_BACKOFF;
                 let _ = status_tx.send(None);
-                let _ = ready_tx.send(true);
+                let _ = zone_names_tx.send(None);
                 let zone1 = match ble_client.read_zone1_name().await {
-                    Ok(name) => Some(name),
+                    Ok(name) => {
+                        info!("Decoded zone 1 name: {}", name);
+                        Some(name)
+                    }
                     Err(e) => {
                         warn!("Failed to read zone 1 name: {}", e);
                         None
                     }
                 };
                 let zone2 = match ble_client.read_zone2_name().await {
-                    Ok(name) => Some(name),
+                    Ok(name) => {
+                        info!("Decoded zone 2 name: {}", name);
+                        Some(name)
+                    }
                     Err(e) => {
                         warn!("Failed to read zone 2 name: {}", e);
                         None
@@ -553,10 +561,12 @@ pub(crate) async fn run_connection_supervisor(
                 };
                 let _ = zone_names_tx.send(Some(ZoneNames { zone1, zone2 }));
                 spawn_notification_consumer(notif_rx, status_tx.clone(), shutdown.clone());
+                let _ = ready_tx.send(true);
                 if wait_for_disconnect_or_shutdown(&mut shutdown, &ble_client).await {
                     break;
                 }
                 let _ = ready_tx.send(false);
+                let _ = zone_names_tx.send(None);
             }
             Err(e) => {
                 handle_connection_failure(&mut ladder, controller.as_ref(), &store, &e, backoff)

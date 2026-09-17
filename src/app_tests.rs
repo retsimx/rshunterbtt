@@ -514,6 +514,8 @@ mod tests {
         let connect_count = Arc::new(AtomicUsize::new(0));
         let write_pw_count = Arc::new(AtomicUsize::new(0));
         let subscribe_count = Arc::new(AtomicUsize::new(0));
+        let read_zone1_count = Arc::new(AtomicUsize::new(0));
+        let read_zone2_count = Arc::new(AtomicUsize::new(0));
         let disconnect_pending = Arc::new(AtomicBool::new(false));
 
         let cc = connect_count.clone();
@@ -549,10 +551,16 @@ mod tests {
             .returning(|_| Box::pin(async { Ok(()) }));
         ble.expect_write_protocol_83()
             .returning(|_| Box::pin(async { Ok(()) }));
-        ble.expect_read_zone1_name()
-            .returning(|| Box::pin(async { Ok("Zone 1".to_string()) }));
-        ble.expect_read_zone2_name()
-            .returning(|| Box::pin(async { Ok("Zone 2".to_string()) }));
+        let z1c = read_zone1_count.clone();
+        ble.expect_read_zone1_name().returning(move || {
+            z1c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("Zone 1".to_string()) })
+        });
+        let z2c = read_zone2_count.clone();
+        ble.expect_read_zone2_name().returning(move || {
+            z2c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("Zone 2".to_string()) })
+        });
 
         let ble = Arc::new(ble);
         let config = mock_config();
@@ -607,6 +615,8 @@ mod tests {
             connect_count.load(Ordering::SeqCst) >= 2
                 && write_pw_count.load(Ordering::SeqCst) >= 2
                 && subscribe_count.load(Ordering::SeqCst) >= 2
+                && read_zone1_count.load(Ordering::SeqCst) >= 2
+                && read_zone2_count.load(Ordering::SeqCst) >= 2
         })
         .await;
 
