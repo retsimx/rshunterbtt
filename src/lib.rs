@@ -71,6 +71,10 @@ pub struct App {
     status_cache: StatusCache,
     status_tx: StatusCacheSender,
     zone_names: ZoneNamesCache,
+    /// Serializes MQTT-triggered BLE work. The MQTT loop spawns a task per
+    /// message, so without this two commands can interleave GATT operations on
+    /// the same device and time out ("Timeout waiting for reply").
+    command_lock: tokio::sync::Mutex<()>,
 }
 
 impl App {
@@ -92,6 +96,7 @@ impl App {
             status_cache: status_rx,
             status_tx,
             zone_names: zone_names_rx,
+            command_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -226,6 +231,11 @@ impl App {
     pub async fn handle_mqtt_message(&self, payload: &[u8]) -> Result<()> {
         let msg: MqttCommand = serde_json::from_slice(payload)?;
         info!("Received MQTT command: {:?}", msg);
+
+        // Serialize BLE work: concurrent commands interleave GATT ops on the
+        // same device and time out. Holding this across the whole command
+        // makes queued commands run one at a time (last one wins for toggles).
+        let _command_guard = self.command_lock.lock().await;
 
         let mut response = MqttResponse {
             cmd: msg.cmd.clone(),
