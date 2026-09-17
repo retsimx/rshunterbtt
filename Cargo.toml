@@ -3,6 +3,9 @@ name = "rshunterbtt"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["mockall"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 btleplug = "0.11"

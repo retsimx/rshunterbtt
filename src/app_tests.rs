@@ -74,8 +74,10 @@ mod tests {
             .returning(|| Box::pin(async { true }));
         ble.expect_read_protocol_83().returning(|| {
             Box::pin(async {
-                let mut p = Second83Protocol::default();
-                p.zone2_enable_manual = 1;
+                let p = Second83Protocol {
+                    zone2_enable_manual: 1,
+                    ..Default::default()
+                };
                 Ok(p)
             })
         });

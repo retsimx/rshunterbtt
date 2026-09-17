@@ -161,11 +161,13 @@ impl App {
                 let minutes = ((run_time_secs % 3600) / 60) as u8;
                 let seconds = (run_time_secs % 60) as u8;
 
-                let mut prot_zone = Second86Protocol::default();
-                prot_zone.w_index = 4;
-                prot_zone.zm_hour = hours;
-                prot_zone.zm_minute = minutes;
-                prot_zone.zm_second = seconds;
+                let prot_zone = Second86Protocol {
+                    w_index: 4,
+                    zm_hour: hours,
+                    zm_minute: minutes,
+                    zm_second: seconds,
+                    ..Default::default()
+                };
 
                 prot83.special_setting = 0;
 
