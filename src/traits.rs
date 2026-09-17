@@ -36,6 +36,7 @@ pub trait MqttClient: Send + Sync {
 #[cfg_attr(any(test, feature = "mockall"), automock)]
 pub trait DatabaseWriter: Send + Sync {
     async fn write_battery(&self, device_name: &str, level: u8) -> Result<()>;
+    async fn write_valve_event(&self, device_name: &str, zone: &str, state: bool) -> Result<()>;
 }
 
 #[async_trait]

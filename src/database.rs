@@ -27,4 +27,17 @@ impl DatabaseWriter for InfluxDbWriter {
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
+
+    async fn write_valve_event(&self, device_name: &str, zone: &str, state: bool) -> Result<()> {
+        let query = WriteQuery::new(chrono::Utc::now().into(), "irrigation")
+            .add_tag("name", device_name)
+            .add_tag("zone", zone)
+            .add_field("state", if state { 1 } else { 0 });
+
+        self.client
+            .query(query)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
+    }
 }
