@@ -16,6 +16,8 @@ pub trait BleClient: Send + Sync {
     async fn write_protocol_86(&self, data: &Second86Protocol) -> Result<()>;
     async fn write_protocol_8b(&self, data: &Second86Protocol) -> Result<()>;
     async fn read_battery(&self) -> Result<u8>;
+    async fn read_zone1_name(&self) -> Result<String>;
+    async fn read_zone2_name(&self) -> Result<String>;
     async fn write_password(&self, password: &[u8; 4]) -> Result<()>;
     async fn subscribe_notifications(
         &self,

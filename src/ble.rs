@@ -11,7 +11,8 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::protocol::{
-    protocol_id_to_uuid, Second83Protocol, Second86Protocol, BATTERY_LEVEL_CHAR_UUID,
+    decode_zone_name, protocol_id_to_uuid, Second83Protocol, Second86Protocol,
+    BATTERY_LEVEL_CHAR_UUID,
 };
 use crate::traits::BleClient;
 
@@ -178,6 +179,26 @@ impl BleClient for BtleplugClient {
         data.get(0)
             .cloned()
             .ok_or_else(|| anyhow!("Battery data empty"))
+    }
+
+    async fn read_zone1_name(&self) -> Result<String> {
+        let p = self.get_peripheral().await?;
+        let char = self
+            .find_characteristic(&p, "0000ff90-0000-1000-8000-00805f9b34fb")
+            .await?;
+        let data = p.read(&char).await?;
+        debug!("Read zone 1 name: {}", hex::encode(&data));
+        decode_zone_name(&data)
+    }
+
+    async fn read_zone2_name(&self) -> Result<String> {
+        let p = self.get_peripheral().await?;
+        let char = self
+            .find_characteristic(&p, "0000ff91-0000-1000-8000-00805f9b34fb")
+            .await?;
+        let data = p.read(&char).await?;
+        debug!("Read zone 2 name: {}", hex::encode(&data));
+        decode_zone_name(&data)
     }
 
     async fn write_password(&self, password: &[u8; 4]) -> Result<()> {

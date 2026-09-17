@@ -9,7 +9,8 @@ mod tests {
     use crate::App;
     use crate::{
         handle_connection_failure, next_backoff, run_battery_polling_loop,
-        run_connection_supervisor, BatteryPollingGuard, BatteryPollingIntervals, INITIAL_BACKOFF,
+        run_connection_supervisor, BatteryPollingGuard, BatteryPollingIntervals, StatusCacheSender,
+        ZoneNamesCacheSender, INITIAL_BACKOFF,
     };
     use anyhow::anyhow;
     use mockall::predicate;
@@ -513,6 +514,8 @@ mod tests {
         let connect_count = Arc::new(AtomicUsize::new(0));
         let write_pw_count = Arc::new(AtomicUsize::new(0));
         let subscribe_count = Arc::new(AtomicUsize::new(0));
+        let read_zone1_count = Arc::new(AtomicUsize::new(0));
+        let read_zone2_count = Arc::new(AtomicUsize::new(0));
         let disconnect_pending = Arc::new(AtomicBool::new(false));
 
         let cc = connect_count.clone();
@@ -548,6 +551,16 @@ mod tests {
             .returning(|_| Box::pin(async { Ok(()) }));
         ble.expect_write_protocol_83()
             .returning(|_| Box::pin(async { Ok(()) }));
+        let z1c = read_zone1_count.clone();
+        ble.expect_read_zone1_name().returning(move || {
+            z1c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("Zone 1".to_string()) })
+        });
+        let z2c = read_zone2_count.clone();
+        ble.expect_read_zone2_name().returning(move || {
+            z2c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("Zone 2".to_string()) })
+        });
 
         let ble = Arc::new(ble);
         let config = mock_config();
@@ -555,6 +568,7 @@ mod tests {
         let (stop_tx, stop_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = watch::channel(false);
         let (status_tx, _status_rx) = watch::channel(None);
+        let (zone_names_tx, _zone_names_rx) = watch::channel(None);
         let ready_check = ready_rx.clone();
 
         let app = Arc::new(
@@ -576,6 +590,7 @@ mod tests {
             stop_rx,
             ready_tx,
             status_tx,
+            zone_names_tx,
             controller,
             store,
         ));
@@ -600,6 +615,8 @@ mod tests {
             connect_count.load(Ordering::SeqCst) >= 2
                 && write_pw_count.load(Ordering::SeqCst) >= 2
                 && subscribe_count.load(Ordering::SeqCst) >= 2
+                && read_zone1_count.load(Ordering::SeqCst) >= 2
+                && read_zone2_count.load(Ordering::SeqCst) >= 2
         })
         .await;
 
@@ -706,5 +723,171 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn temp_zone_state_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rshunterbtt-zone-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn spawn_supervisor_with_zone_names(
+        ble: Arc<MockBleClient>,
+        config: Config,
+        ready_tx: watch::Sender<bool>,
+        status_tx: StatusCacheSender,
+        zone_names_tx: ZoneNamesCacheSender,
+    ) -> watch::Sender<bool> {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let controller = Arc::new(MockResilienceController::new());
+        let store = ResilienceStateStore::with_path(temp_zone_state_path());
+        tokio::spawn(run_connection_supervisor(
+            ble,
+            config,
+            stop_rx,
+            ready_tx,
+            status_tx,
+            zone_names_tx,
+            controller,
+            store,
+        ));
+        stop_tx
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_zone_names_appear_in_status_response() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        ble.expect_connect()
+            .returning(|_| Box::pin(async { Ok(()) }));
+        ble.expect_write_password()
+            .returning(|_| Box::pin(async { Ok(()) }));
+        ble.expect_subscribe_notifications().returning(|_| {
+            let (_, rx) = tokio::sync::mpsc::channel(1);
+            Box::pin(async move { Ok(rx) })
+        });
+        ble.expect_is_connected()
+            .returning(|| Box::pin(async { true }));
+        ble.expect_read_zone1_name()
+            .returning(|| Box::pin(async { Ok("Front Lawn".to_string()) }));
+        ble.expect_read_zone2_name()
+            .returning(|| Box::pin(async { Ok("Back Yard".to_string()) }));
+        ble.expect_read_status()
+            .returning(|| Box::pin(async { Ok(vec![0; 20]) }));
+
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""zone1_name":"Front Lawn""#)
+                    .and(predicate::str::contains(r#""zone2_name":"Back Yard""#)),
+            )
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let ble = Arc::new(ble);
+        let config = mock_config();
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let (status_tx, status_rx) = watch::channel(None);
+        let (zone_names_tx, zone_names_rx) = watch::channel(None);
+
+        let app = Arc::new(
+            App::new(config.clone(), ble.clone(), Arc::new(mqtt), Arc::new(db))
+                .with_connection_ready(ready_rx)
+                .with_status_cache(status_rx, status_tx.clone())
+                .with_zone_names(zone_names_rx),
+        );
+
+        let stop_tx =
+            spawn_supervisor_with_zone_names(ble, config, ready_tx, status_tx, zone_names_tx);
+
+        wait_until(|| {
+            app.zone_names
+                .borrow()
+                .as_ref()
+                .map(|z| z.zone1.is_some())
+                .unwrap_or(false)
+        })
+        .await;
+
+        let payload = r#"{"cmd":"status","zone":"flower"}"#;
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+
+        let _ = stop_tx.send(true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_zone_name_read_failure_omits_field_and_keeps_connection() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let cc = connect_count.clone();
+        ble.expect_connect().returning(move |_| {
+            cc.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        ble.expect_write_password()
+            .returning(|_| Box::pin(async { Ok(()) }));
+        ble.expect_subscribe_notifications().returning(|_| {
+            let (_, rx) = tokio::sync::mpsc::channel(1);
+            Box::pin(async move { Ok(rx) })
+        });
+        ble.expect_is_connected()
+            .returning(|| Box::pin(async { true }));
+        ble.expect_read_zone1_name()
+            .returning(|| Box::pin(async { Err(anyhow!("read failed")) }));
+        ble.expect_read_zone2_name()
+            .returning(|| Box::pin(async { Err(anyhow!("read failed")) }));
+        ble.expect_read_status()
+            .returning(|| Box::pin(async { Ok(vec![0; 20]) }));
+
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains("zone1_name")
+                    .not()
+                    .and(predicate::str::contains("zone2_name").not()),
+            )
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let ble = Arc::new(ble);
+        let config = mock_config();
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let (status_tx, status_rx) = watch::channel(None);
+        let (zone_names_tx, zone_names_rx) = watch::channel(None);
+
+        let app = Arc::new(
+            App::new(config.clone(), ble.clone(), Arc::new(mqtt), Arc::new(db))
+                .with_connection_ready(ready_rx)
+                .with_status_cache(status_rx, status_tx.clone())
+                .with_zone_names(zone_names_rx),
+        );
+
+        let stop_tx =
+            spawn_supervisor_with_zone_names(ble, config, ready_tx, status_tx, zone_names_tx);
+
+        // Wait until the supervisor has finished its best-effort zone name reads
+        // (channel populated with None values) without tearing down the connection.
+        wait_until(|| app.zone_names.borrow().is_some()).await;
+
+        let payload = r#"{"cmd":"status","zone":"flower"}"#;
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+
+        assert_eq!(
+            connect_count.load(Ordering::SeqCst),
+            1,
+            "zone name read failure must not tear down the connection or reconnect"
+        );
+
+        let _ = stop_tx.send(true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
