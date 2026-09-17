@@ -74,6 +74,69 @@ Payload: `{"cmd": "status", "zone": "grass"}`
 Topic: `irrigation/c2s/<device_name>`
 Payload example: `{"cmd":"on_off","zone":"grass","on_off":true,"success":true,"ack":true}`
 
+## Connection Resilience Escalation Ladder
+
+The connection supervisor escalates through a ladder of recovery actions as
+connection-setup failures accumulate. The ladder is pure decision logic
+(`src/resilience.rs`); the actual recovery actions are performed by a
+`ResilienceController` (`src/dbus_control.rs`, `src/reboot.rs`).
+
+### Thresholds and rungs
+
+| Rung | Trigger | Action |
+|------|---------|--------|
+| 1 | First failures | Keep retrying with exponential backoff (1s → 60s cap). |
+| 2 | **5 consecutive failures within a rolling 10-minute window** | **Power-cycle the BLE adapter** via D-Bus (`Powered=false`, 1s delay, `Powered=true`). Rate-limited to once per 15 minutes. |
+| 3 | **15 consecutive failures** (5 + 10) after a power-cycle has been attempted | **Reboot the host** via `reboot(2)` (`RB_AUTOBOOT`). Rate-limited to once per 30 minutes, max 3 reboots per 24 hours. |
+| 4 | 24h reboot cap (3) reached | Stop escalating; keep retrying with backoff. |
+
+A successful connection resets the consecutive-failure counter and the failure
+window. Every rung transition and rate-limit skip is logged at `error`/`warn`
+with the current failure count.
+
+### State file
+
+Escalation state is persisted durably (write + flush + `fsync`, including the
+directory) so it survives a reboot and is loaded on startup before any
+escalation decision:
+
+```
+/var/lib/rshunterbtt/<device_name>-resilience-state.json
+```
+
+Format (pretty-printed JSON):
+
+```json
+{
+  "last_power_cycle_at": "2026-01-01T00:00:00Z",
+  "reboot_timestamps": ["2026-01-01T00:00:00Z"]
+}
+```
+
+- `last_power_cycle_at`: timestamp of the most recent adapter power-cycle.
+- `reboot_timestamps`: list of host reboot timestamps; entries older than 24h
+  are pruned on load and on each failure evaluation.
+
+### Required host permissions
+
+- **Root** for D-Bus adapter control (`Powered` property on `org.bluez`) and
+  for `reboot(2)`.
+- **`CAP_NET_ADMIN`** for the raw HCI monitor socket (diagnostic only; the
+  monitor is non-gating and logs HCI disconnection/address events).
+
+### Resetting the rate-limit state manually
+
+To reset the escalation state (e.g. for testing), delete the state file and
+restart the service:
+
+```bash
+rm -f /var/lib/rshunterbtt/<device_name>-resilience-state.json
+rc-service rshunterbtt restart
+```
+
+The supervisor will start from a clean state (no pending power-cycle or reboot
+rate limits).
+
 ## Development
 
 ### Running Tests

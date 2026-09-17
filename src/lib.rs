@@ -1,9 +1,13 @@
 pub mod ble;
 pub mod config;
 pub mod database;
+pub mod dbus_control;
 pub mod hci;
+pub mod hci_monitor;
 pub mod mqtt;
 pub mod protocol;
+pub mod reboot;
+pub mod resilience;
 pub mod traits;
 
 #[cfg(test)]
@@ -11,8 +15,10 @@ mod app_tests;
 
 use crate::config::Config;
 use crate::protocol::{Second82Protocol, Second86Protocol};
-use crate::traits::{BleClient, DatabaseWriter, MqttClient};
+use crate::resilience::{LadderAction, ResilienceLadder, ResilienceState, ResilienceStateStore};
+use crate::traits::{BleClient, DatabaseWriter, MqttClient, ResilienceController};
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -423,13 +429,74 @@ async fn wait_for_disconnect_or_shutdown(
     }
 }
 
+async fn handle_connection_failure(
+    ladder: &mut ResilienceLadder,
+    controller: &dyn ResilienceController,
+    store: &ResilienceStateStore,
+    err: &anyhow::Error,
+    backoff: Duration,
+) {
+    let now = Utc::now();
+    let action = ladder.on_connection_failure(now);
+    let count = ladder.consecutive_failures();
+    match action {
+        LadderAction::PowerCycle => {
+            error!(
+                "Connection setup failed ({} consecutive failures): power-cycling adapter",
+                count
+            );
+            if let Err(pe) = controller.power_cycle_adapter().await {
+                error!("Power-cycle adapter failed: {}", pe);
+            }
+            if let Err(se) = store.save(ladder.state()) {
+                error!("Failed to persist resilience state: {}", se);
+            }
+        }
+        LadderAction::Reboot => {
+            error!(
+                "Connection setup failed ({} consecutive failures): rebooting host",
+                count
+            );
+            if let Err(se) = store.save(ladder.state()) {
+                error!("Failed to persist resilience state before reboot: {}", se);
+            }
+            if let Err(re) = controller.reboot_host().await {
+                error!("Reboot failed: {}", re);
+            }
+        }
+        LadderAction::KeepRetrying => {
+            warn!(
+                "Connection setup failed ({} consecutive failures): 24h reboot cap reached; keep retrying",
+                count
+            );
+        }
+        LadderAction::None => {
+            error!(
+                "Connection setup failed: {}. Retrying in {}s...",
+                err,
+                backoff.as_secs()
+            );
+        }
+    }
+}
+
 pub(crate) async fn run_connection_supervisor(
     ble_client: Arc<dyn BleClient>,
     config: Config,
     mut shutdown: watch::Receiver<bool>,
     ready_tx: watch::Sender<bool>,
     status_tx: StatusCacheSender,
+    controller: Arc<dyn ResilienceController>,
+    store: ResilienceStateStore,
 ) {
+    let state = match store.load() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to load resilience state ({}); starting fresh", e);
+            ResilienceState::default()
+        }
+    };
+    let mut ladder = ResilienceLadder::from_state(state);
     let mut backoff = INITIAL_BACKOFF;
     loop {
         if *shutdown.borrow() {
@@ -437,6 +504,7 @@ pub(crate) async fn run_connection_supervisor(
         }
         match run_connection_setup(&ble_client, &config).await {
             Ok(notif_rx) => {
+                ladder.on_connection_success();
                 backoff = INITIAL_BACKOFF;
                 let _ = status_tx.send(None);
                 let _ = ready_tx.send(true);
@@ -447,11 +515,8 @@ pub(crate) async fn run_connection_supervisor(
                 let _ = ready_tx.send(false);
             }
             Err(e) => {
-                error!(
-                    "Connection setup failed: {}. Retrying in {}s...",
-                    e,
-                    backoff.as_secs()
-                );
+                handle_connection_failure(&mut ladder, controller.as_ref(), &store, &e, backoff)
+                    .await;
                 let _ = ready_tx.send(false);
                 if wait_for_shutdown_or_timeout(&mut shutdown, backoff).await {
                     break;
@@ -504,16 +569,20 @@ impl ConnectionGuard {
     pub(crate) fn start(
         ble_client: Arc<dyn BleClient>,
         config: Config,
+        controller: Arc<dyn ResilienceController>,
     ) -> (Self, watch::Receiver<bool>, StatusCache, StatusCacheSender) {
         let (stop_tx, stop_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(None);
+        let store = ResilienceStateStore::new(&config.device_name);
         let task = tokio::spawn(run_connection_supervisor(
             ble_client,
             config,
             stop_rx,
             ready_tx,
             status_tx.clone(),
+            controller,
+            store,
         ));
         (Self { stop_tx, task }, ready_rx, status_rx, status_tx)
     }
@@ -528,6 +597,8 @@ impl Drop for ConnectionGuard {
 
 pub async fn run_app() -> Result<()> {
     tracing_subscriber::fmt::init();
+
+    crate::hci_monitor::spawn_hci_monitor();
 
     loop {
         info!("Starting rshunterbtt...");
@@ -564,8 +635,9 @@ async fn run_app_instance() -> Result<()> {
         db_writer,
     );
 
+    let controller = Arc::new(crate::dbus_control::SystemResilienceController::default());
     let (connection_guard, connection_ready, status_cache, status_tx) =
-        ConnectionGuard::start(ble_client, config.clone());
+        ConnectionGuard::start(ble_client, config.clone(), controller);
     let app = Arc::new(
         app.with_connection_ready(connection_ready)
             .with_status_cache(status_cache, status_tx),
