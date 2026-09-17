@@ -36,14 +36,21 @@ fn with_retry<T>(
         match attempt() {
             Ok(v) => return Ok(v),
             Err(e) => {
-                last_err = Some(e);
                 if i + 1 < attempts {
+                    debug!(
+                        "LE conn update attempt {}/{} failed ({}); retrying in {:?}",
+                        i + 1,
+                        attempts,
+                        e,
+                        delay
+                    );
                     std::thread::sleep(delay);
                 }
+                last_err = Some(e);
             }
         }
     }
-    Err(last_err.unwrap())
+    Err(last_err.unwrap_or_else(|| anyhow!("no retry attempts configured")))
 }
 
 fn interval_units(ms: u16) -> u16 {
@@ -325,6 +332,17 @@ mod tests {
         assert_eq!(timeout_units(20000), 2000);
         assert_eq!(timeout_units(10000), 1000);
         assert_eq!(timeout_units(3000), 300);
+    }
+
+    #[test]
+    fn test_with_retry_succeeds_first_attempt() {
+        let mut calls = 0;
+        let result = with_retry(3, Duration::from_millis(1), || {
+            calls += 1;
+            Ok(42u16)
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls, 1);
     }
 
     #[test]
