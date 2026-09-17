@@ -176,7 +176,7 @@ impl BleClient for BtleplugClient {
             .await?;
         let data = p.read(&char).await?;
         debug!("Read battery: {}", hex::encode(&data));
-        data.get(0)
+        data.first()
             .cloned()
             .ok_or_else(|| anyhow!("Battery data empty"))
     }
