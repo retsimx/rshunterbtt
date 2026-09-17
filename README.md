@@ -41,6 +41,11 @@ MQTT_PUB_TOPIC=irrigation/c2s/rear
 # Run-duration failsafe (seconds)
 # DEFAULT_RUN_SECONDS=7200
 
+# BLE connection interval (ms; 8-4000, default 4000). Lower = faster MQTT
+# command turnaround but more radio connection events (battery drain).
+# Empirical: 60ms -> ~0.5s commands, 1000ms -> ~5s, 4000ms -> ~21s.
+# CONN_INTERVAL_MS=1000
+
 # InfluxDB Configuration
 INFLUXDB_URL=http://10.0.25.10:8086
 INFLUXDB_TOKEN=your_token_here

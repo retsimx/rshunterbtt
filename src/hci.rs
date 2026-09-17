@@ -21,7 +21,6 @@ const HCIGETCONNLIST: libc::c_ulong = 0x800448d4;
 #[cfg(target_pointer_width = "32")]
 const HCIGETCONNLIST: libc::c_int = 0x800448d4u32 as libc::c_int;
 
-const TARGET_INTERVAL_MS: u16 = 4000;
 const SUPERVISION_TIMEOUT_MS: u16 = 20000;
 const MAX_INTERVAL_RETRIES: usize = 3;
 const INTERVAL_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -234,9 +233,9 @@ fn find_connection_handle(fd: RawFd, address: &str) -> Result<u16> {
     Err(anyhow!("device {} not found in connection list", address))
 }
 
-fn request_connection_interval(fd: RawFd, handle: u16) -> Result<u16> {
+fn request_connection_interval(fd: RawFd, handle: u16, interval_ms: u16) -> Result<u16> {
     with_retry(MAX_INTERVAL_RETRIES, INTERVAL_RETRY_DELAY, || {
-        let min = interval_units(TARGET_INTERVAL_MS);
+        let min = interval_units(interval_ms);
         let max = min;
         let timeout = timeout_units(SUPERVISION_TIMEOUT_MS);
         let mut params = Vec::with_capacity(14);
@@ -298,16 +297,16 @@ fn request_connection_interval(fd: RawFd, handle: u16) -> Result<u16> {
     })
 }
 
-pub fn request_4000ms_interval(device_address: &str) -> Result<()> {
+pub fn request_interval(device_address: &str, interval_ms: u16) -> Result<()> {
     let fd = open_hci_socket()?;
     let result = (|| {
         let handle = find_connection_handle(fd, device_address)?;
         debug!("connection handle for {}: {}", device_address, handle);
-        let negotiated = request_connection_interval(fd, handle)?;
+        let negotiated = request_connection_interval(fd, handle, interval_ms)?;
         let negotiated_ms = negotiated as u32 * 5 / 4;
         info!(
             "connection interval updated: requested {}ms, negotiated {}ms",
-            TARGET_INTERVAL_MS, negotiated_ms
+            interval_ms, negotiated_ms
         );
         Ok(())
     })();

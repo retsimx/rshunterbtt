@@ -558,8 +558,11 @@ async fn run_connection_setup(
     ble_client.connect(&config.device_address).await?;
     info!("Connection established with {}.", config.device_address);
 
-    if let Err(e) = crate::hci::request_4000ms_interval(&config.device_address) {
-        warn!("Failed to request 4000ms connection interval: {}", e);
+    if let Err(e) = crate::hci::request_interval(&config.device_address, config.conn_interval_ms) {
+        warn!(
+            "Failed to request {}ms connection interval: {}",
+            config.conn_interval_ms, e
+        );
     }
 
     let password = build_password(config.device_password.as_deref());

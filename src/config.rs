@@ -15,6 +15,7 @@ pub struct Config {
     pub influxdb_bucket: String,
     pub device_password: Option<String>,
     pub default_run_seconds: u32,
+    pub conn_interval_ms: u16,
 }
 
 impl Config {
@@ -40,6 +41,19 @@ impl Config {
                 .unwrap_or_else(|_| "7200".to_string())
                 .parse()
                 .context("DEFAULT_RUN_SECONDS must be a number")?,
+            conn_interval_ms: {
+                let ms: u16 = std::env::var("CONN_INTERVAL_MS")
+                    .unwrap_or_else(|_| "4000".to_string())
+                    .parse()
+                    .context("CONN_INTERVAL_MS must be a number")?;
+                if !(8..=4000).contains(&ms) {
+                    return Err(anyhow::anyhow!(
+                        "CONN_INTERVAL_MS must be between 8 and 4000 (BLE range), got {}",
+                        ms
+                    ));
+                }
+                ms
+            },
         };
 
         Ok(config)
@@ -64,6 +78,8 @@ mod tests {
         std::env::set_var("INFLUXDB_TOKEN", "token");
         std::env::set_var("INFLUXDB_ORG", "org");
         std::env::set_var("INFLUXDB_BUCKET", "bucket");
+        // Optional vars: start each test from a known state.
+        std::env::remove_var("CONN_INTERVAL_MS");
     }
 
     #[test]
@@ -89,6 +105,34 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         required_env();
         std::env::set_var("DEFAULT_RUN_SECONDS", "not_a_number");
+        assert!(Config::from_env().is_err());
+    }
+
+    #[test]
+    fn conn_interval_defaults_to_4000_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::remove_var("CONN_INTERVAL_MS");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.conn_interval_ms, 4000);
+    }
+
+    #[test]
+    fn conn_interval_parses_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("CONN_INTERVAL_MS", "1000");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.conn_interval_ms, 1000);
+    }
+
+    #[test]
+    fn conn_interval_fails_when_out_of_ble_range() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("CONN_INTERVAL_MS", "9999");
+        assert!(Config::from_env().is_err());
+        std::env::set_var("CONN_INTERVAL_MS", "1");
         assert!(Config::from_env().is_err());
     }
 }
