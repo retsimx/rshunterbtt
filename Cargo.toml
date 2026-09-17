@@ -2,6 +2,9 @@
 name = "rshunterbtt"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A resilient Rust-based MQTT/BLE bridge for Hunter BTT irrigation controllers"
+repository = "https://github.com/retsimx/rshunterbtt"
 
 [features]
 default = ["mockall"]

@@ -4,15 +4,29 @@ A resilient Rust-based MQTT/BLE bridge for Hunter BTT irrigation controllers, mi
 
 ## Overview
 
-`rshunterbtt` acts as a bridge between an MQTT broker and Hunter BTT Bluetooth Tap Timers. It allows for remote control (start/stop) and monitoring (status, battery level) of irrigation zones via MQTT messages. Each instance is designed to handle exactly one Hunter BTT device, typically deployed on a Raspberry Pi Zero W.
+`rshunterbtt` acts as a bridge between an MQTT broker and Hunter BTT Bluetooth Tap Timers. It allows for remote control (start/stop) and monitoring (status, battery level) of irrigation zones via MQTT messages. Each instance is designed to handle exactly one Hunter BTT device, typically deployed on a Raspberry Pi Zero W, and holds a persistent authenticated BLE connection to it, driven by the device's own status notifications rather than polling.
 
 ## Features
 
-- **Asynchronous Architecture**: Built on `tokio` for efficient handling of concurrent MQTT and BLE operations.
-- **Resilient Supervisor**: High-level supervisor loop ensures the service automatically reconnects to MQTT and retries BLE operations after failures or reboots.
-- **Dependency Injection**: Utilizes Rust traits and `mockall` for comprehensive unit and integration testing.
-- **Cross-Compilation**: Fully configured for `cross` to target `arm-unknown-linux-musleabihf` (Raspberry Pi Zero W / ARMv6).
-- **Production Ready**: Includes OpenRC service scripts and detailed `tracing` logs with raw GATT byte debugging.
+- **Persistent BLE connection**: holds a single GATT connection open per device
+  — authenticated (4-byte password written to `ff81`) and subscribed to zone
+  notifications — instead of reconnecting for every operation.
+- **Notification-driven status**: subscribes to the `ff82` status characteristic
+  and caches pushed state changes, so a self-timed stop or a physical button
+  press is observed immediately rather than polled for.
+- **Resilient supervisor**: reconnects with exponential backoff after any drop,
+  and escalates through a recovery ladder (BLE adapter power-cycle, then host
+  reboot) when connection-setup failures persist.
+- **Interval guard**: requests a configurable BLE connection interval and watches
+  the controller's HCI event stream, re-applying the interval whenever the
+  peripheral re-negotiates it back to fast.
+- **MQTT control + telemetry**: zone commands and status over MQTT; battery
+  telemetry written directly to InfluxDB, bypassing MQTT.
+- **Dependency injection**: Rust traits with `mockall` for comprehensive unit and
+  integration testing.
+- **Cross-compilation**: configured for `cross` to target
+  `arm-unknown-linux-musleabihf` (Raspberry Pi Zero W / ARMv6).
+- **Production ready**: OpenRC service script and detailed `tracing` logs.
 
 ## Hardware Mapping
 
@@ -99,12 +113,39 @@ Example with an explicit duration:
 `{"cmd": "on_off", "zone": "grass", "on_off": true, "duration_seconds": 1800}`
 
 ### Status (S2C)
-Topic: `irrigation/s2c/<device_name>/status`
+Topic: `irrigation/s2c/<device_name>/<zone>`
 Payload: `{"cmd": "status", "zone": "grass"}`
+
+The bridge subscribes to `irrigation/s2c/<device_name>/#`, so the status
+command arrives on the same topic family as `on_off`.
 
 ### Responses (C2S)
 Topic: `irrigation/c2s/<device_name>`
-Payload example: `{"cmd":"on_off","zone":"grass","on_off":true,"success":true,"ack":true}`
+
+The bridge publishes a response for every command:
+
+- `on_off`: `{"cmd":"on_off","zone":"grass","on_off":true,"success":true,"ack":true}`
+- `status`: `{"cmd":"status","zone":"grass","status":1,"ack":true,"suspend_watering":false}`
+
+`ack` reports whether the command reached the device; `success` reports whether
+the BLE write actually took effect.
+
+The bridge also **pushes** a `status` response whenever the device reports a
+zone-state change over `ff82` — a self-timed stop, a physical button press — so
+consumers do not have to poll for it:
+`{"cmd":"status","zone":"garden","status":0,"ack":true}`.
+
+### Zone-state values
+
+The `status` field is an **enum, not a boolean**. The device reports `1` when a
+zone is idle, `0` for standby, `2` for a scheduled-watering reminder, and `5`,
+`9`, or `17` while it is actually watering. Consumers should treat
+`{5, 9, 17}` as "on".
+
+### Zone-name mapping
+
+The device maps the zone name `grass` to zone 2 and anything else to zone 1, so
+the name must be exactly `grass` or `garden` — a typo silently targets zone 1.
 
 ## Connection Resilience Escalation Ladder
 
@@ -153,8 +194,10 @@ Format (pretty-printed JSON):
 
 - **Root** for D-Bus adapter control (`Powered` property on `org.bluez`) and
   for `reboot(2)`.
-- **`CAP_NET_ADMIN`** for the raw HCI monitor socket (diagnostic only; the
-  monitor is non-gating and logs HCI disconnection/address events).
+- **`CAP_NET_ADMIN`** (i.e. run as root) for the raw HCI sockets used to request
+  the connection interval and to run the interval guard — the monitor decodes
+  `LE Connection Update Complete` events and re-applies the configured interval
+  when the peripheral re-negotiates it away.
 
 ### Resetting the rate-limit state manually
 
@@ -185,32 +228,37 @@ cross build --target arm-unknown-linux-musleabihf --release
 
 ### Required host BLE configuration (one-time)
 
-The bridge requests a **4000ms** connection interval at runtime via a
-pure-Rust HCI connection-parameter update (an `LE Connection Update`
-command sent over a raw HCI socket) — no external tools required. This is
-necessary because BlueZ's central-role connection otherwise uses the
-peripheral's advertised preferred parameters (100–200ms), not the
-`main.conf` defaults.
+The bridge requests its configured connection interval (`CONN_INTERVAL_MS`)
+at runtime via a pure-Rust HCI connection-parameter update (an `LE Connection
+Update` command sent over a raw HCI socket) — no external tools required. This
+is necessary because BlueZ's central-role connection otherwise uses the
+peripheral's advertised preferred parameters, not the `main.conf` defaults.
 
-In addition, configuring the BlueZ default connection parameters in
-`/etc/bluetooth/main.conf` is **recommended** as a fallback default. Add
-the following to the `[LE]` section:
+The Hunter BTT peripheral re-negotiates the interval back towards ~50ms shortly
+after connecting (and intermittently afterwards), which BlueZ honours. The
+bridge handles this two ways: connection setup deliberately connects,
+disconnects, and reconnects — the peripheral only re-negotiates on its first
+connection after boot — and the interval guard re-applies the configured value
+whenever it observes the interval drift away from target.
+
+Keep BlueZ's default connection parameters in `/etc/bluetooth/main.conf` in
+sync with `CONN_INTERVAL_MS` as a fallback for when the runtime request is
+rejected. The interval fields are in ×1.25ms steps, i.e. `interval_ms × 0.8`
+(so 1000ms → 800). Add to the `[LE]` section:
 
 ```ini
 [LE]
-MinConnectionInterval=3200
-MaxConnectionInterval=3200
+MinConnectionInterval=800
+MaxConnectionInterval=800
 ConnectionLatency=0
 ConnectionSupervisionTimeout=2000
 ```
 
-Units: the interval fields are in ×1.25ms steps (`3200 × 1.25ms =
-4000ms`); the supervision timeout is in ×10ms steps (`2000 × 10ms =
-20000ms`, above the mandatory floor of `2×(1+latency)×interval =
-8000ms` and within the 32000ms ceiling).
+The supervision timeout is in ×10ms steps (`2000 × 10ms = 20000ms`, above the
+mandatory floor of `2×(1+latency)×interval` and within the 32000ms ceiling).
 
-Apply the change with `rc-service bluetooth restart` (Alpine/OpenRC
-hosts — no systemd) or a host reboot.
+Apply the change with `rc-service bluetooth restart` (Alpine/OpenRC hosts — no
+systemd), then reboot the host so the interval is applied cleanly.
 
 1. Copy the cross-compiled binary to `/root/rshunterbtt/rshunterbtt`.
 2. Create `/root/rshunterbtt/.env` with the correct device settings.
@@ -220,3 +268,7 @@ hosts — no systemd) or a host reboot.
    rc-update add rshunterbtt default
    rc-service rshunterbtt start
    ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
