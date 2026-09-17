@@ -405,6 +405,9 @@ pub(crate) async fn run_valve_event_observer(
 ) {
     let mut prev: Option<Second82Protocol> = None;
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
             changed = status_cache.changed() => {
                 if changed.is_err() {
