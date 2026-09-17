@@ -397,6 +397,85 @@ impl Drop for BatteryPollingGuard {
     }
 }
 
+pub(crate) async fn run_valve_event_observer(
+    mut status_cache: StatusCache,
+    db_writer: Arc<dyn DatabaseWriter>,
+    device_name: String,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut prev: Option<Second82Protocol> = None;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            changed = status_cache.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let new = status_cache.borrow().clone();
+                if let Some(new) = new {
+                    if let Some(prev) = &prev {
+                        if prev.zone1_state != new.zone1_state {
+                            if let Err(e) = db_writer
+                                .write_valve_event(&device_name, "zone1", new.zone1_state)
+                                .await
+                            {
+                                warn!("Failed to write valve event for zone1: {}", e);
+                            }
+                        }
+                        if prev.zone2_state != new.zone2_state {
+                            if let Err(e) = db_writer
+                                .write_valve_event(&device_name, "zone2", new.zone2_state)
+                                .await
+                            {
+                                warn!("Failed to write valve event for zone2: {}", e);
+                            }
+                        }
+                    }
+                    prev = Some(new);
+                } else {
+                    prev = None;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct ValveEventObserverGuard {
+    stop_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl ValveEventObserverGuard {
+    pub(crate) fn start(
+        status_cache: StatusCache,
+        db_writer: Arc<dyn DatabaseWriter>,
+        device_name: String,
+    ) -> Self {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_valve_event_observer(
+            status_cache,
+            db_writer,
+            device_name,
+            stop_rx,
+        ));
+        Self { stop_tx, task }
+    }
+}
+
+impl Drop for ValveEventObserverGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        self.task.abort();
+    }
+}
+
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(65);
@@ -714,6 +793,7 @@ async fn run_app_instance() -> Result<()> {
         &config.influxdb_org,
         &config.influxdb_bucket,
     ));
+    let db_writer_observer = db_writer.clone();
 
     let app = App::new(
         config.clone(),
@@ -725,6 +805,7 @@ async fn run_app_instance() -> Result<()> {
     let controller = Arc::new(crate::dbus_control::SystemResilienceController::default());
     let (connection_guard, connection_ready, status_cache, status_tx, zone_names) =
         ConnectionGuard::start(ble_client, config.clone(), controller);
+    let status_cache_observer = status_cache.clone();
     let app = Arc::new(
         app.with_connection_ready(connection_ready)
             .with_status_cache(status_cache, status_tx)
@@ -733,6 +814,11 @@ async fn run_app_instance() -> Result<()> {
 
     let _battery_polling =
         BatteryPollingGuard::start(app.clone(), BatteryPollingIntervals::PRODUCTION);
+    let _valve_event_observer = ValveEventObserverGuard::start(
+        status_cache_observer,
+        db_writer_observer,
+        config.device_name.clone(),
+    );
     let _connection = connection_guard;
 
     // Subscribe to MQTT topic

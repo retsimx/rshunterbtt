@@ -9,8 +9,8 @@ mod tests {
     use crate::App;
     use crate::{
         handle_connection_failure, next_backoff, run_battery_polling_loop,
-        run_connection_supervisor, BatteryPollingGuard, BatteryPollingIntervals, StatusCacheSender,
-        ZoneNamesCacheSender, INITIAL_BACKOFF,
+        run_connection_supervisor, run_valve_event_observer, BatteryPollingGuard,
+        BatteryPollingIntervals, StatusCacheSender, ZoneNamesCacheSender, INITIAL_BACKOFF,
     };
     use anyhow::anyhow;
     use mockall::predicate;
@@ -1010,5 +1010,196 @@ mod tests {
 
         let _ = stop_tx.send(true);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    fn valve_event_protocol(zone1: bool, zone2: bool) -> Second82Protocol {
+        let mut data = vec![0u8; 14];
+        data[10] = zone1 as u8;
+        data[11] = zone2 as u8;
+        Second82Protocol::from_bytes(&data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_valve_event_observer_detects_transitions() {
+        let mut db = MockDatabaseWriter::new();
+
+        db.expect_write_valve_event()
+            .with(eq("test_device"), eq("zone1"), eq(true))
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+        db.expect_write_valve_event()
+            .with(eq("test_device"), eq("zone1"), eq(false))
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(run_valve_event_observer(
+            status_rx,
+            Arc::new(db),
+            "test_device".to_string(),
+            shutdown_rx,
+        ));
+
+        let seed = valve_event_protocol(false, false);
+        status_tx.send(Some(seed.clone())).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx.send(Some(seed)).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx
+            .send(Some(valve_event_protocol(true, false)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx
+            .send(Some(valve_event_protocol(false, false)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valve_event_observer_detects_zone2_transitions() {
+        let mut db = MockDatabaseWriter::new();
+
+        db.expect_write_valve_event()
+            .with(eq("test_device"), eq("zone2"), eq(true))
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+        db.expect_write_valve_event()
+            .with(eq("test_device"), eq("zone2"), eq(false))
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(run_valve_event_observer(
+            status_rx,
+            Arc::new(db),
+            "test_device".to_string(),
+            shutdown_rx,
+        ));
+
+        let seed = valve_event_protocol(false, false);
+        status_tx.send(Some(seed.clone())).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx.send(Some(seed)).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx
+            .send(Some(valve_event_protocol(false, true)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx
+            .send(Some(valve_event_protocol(false, false)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valve_event_observer_noop_produces_no_write() {
+        let mut db = MockDatabaseWriter::new();
+        db.expect_write_valve_event().times(0);
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(run_valve_event_observer(
+            status_rx,
+            Arc::new(db),
+            "test_device".to_string(),
+            shutdown_rx,
+        ));
+
+        let seed = valve_event_protocol(false, false);
+        status_tx.send(Some(seed.clone())).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx.send(Some(seed)).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valve_event_observer_continues_after_write_failure() {
+        let mut db = MockDatabaseWriter::new();
+
+        db.expect_write_valve_event()
+            .with(eq("test_device"), eq("zone1"), eq(true))
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Err(anyhow!("boom")) }));
+        db.expect_write_valve_event()
+            .with(eq("test_device"), eq("zone1"), eq(false))
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(run_valve_event_observer(
+            status_rx,
+            Arc::new(db),
+            "test_device".to_string(),
+            shutdown_rx,
+        ));
+
+        let seed = valve_event_protocol(false, false);
+        status_tx.send(Some(seed.clone())).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx
+            .send(Some(valve_event_protocol(true, false)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx.send(Some(seed)).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valve_event_observer_resets_state_on_connection_reset() {
+        let mut db = MockDatabaseWriter::new();
+        db.expect_write_valve_event().times(0);
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(run_valve_event_observer(
+            status_rx,
+            Arc::new(db),
+            "test_device".to_string(),
+            shutdown_rx,
+        ));
+
+        let seed = valve_event_protocol(false, false);
+        status_tx.send(Some(seed.clone())).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx.send(None).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        status_tx
+            .send(Some(valve_event_protocol(true, false)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
     }
 }
