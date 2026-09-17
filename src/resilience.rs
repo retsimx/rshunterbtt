@@ -79,26 +79,6 @@ impl ResilienceLadder {
         self.prune_failure_window(now);
         self.state.prune_reboots(now);
 
-        // Rung 2: 5 consecutive failures within a rolling 10-minute window -> PowerCycle.
-        if self.consecutive_failures >= POWER_CYCLE_THRESHOLD
-            && self.failures_within_window(now) >= POWER_CYCLE_THRESHOLD
-        {
-            let rate_limited = self
-                .state
-                .last_power_cycle_at
-                .map(|last| now.signed_duration_since(last) < POWER_CYCLE_RATE_LIMIT)
-                .unwrap_or(false);
-            if rate_limited {
-                warn!(
-                    "Power-cycle skipped due to rate limit (last at {:?}); continuing to reboot rung",
-                    self.state.last_power_cycle_at
-                );
-            } else {
-                self.state.last_power_cycle_at = Some(now);
-                return LadderAction::PowerCycle;
-            }
-        }
-
         // Rung 3: 10 further consecutive failures after a power-cycle has been attempted -> Reboot.
         if self.state.last_power_cycle_at.is_some()
             && self.consecutive_failures >= POWER_CYCLE_THRESHOLD + REBOOT_EXTRA_FAILURES
@@ -122,6 +102,26 @@ impl ResilienceLadder {
             } else {
                 self.state.reboot_timestamps.push(now);
                 return LadderAction::Reboot;
+            }
+        }
+
+        // Rung 2: 5 consecutive failures within a rolling 10-minute window -> PowerCycle.
+        if self.consecutive_failures >= POWER_CYCLE_THRESHOLD
+            && self.failures_within_window(now) >= POWER_CYCLE_THRESHOLD
+        {
+            let rate_limited = self
+                .state
+                .last_power_cycle_at
+                .map(|last| now.signed_duration_since(last) < POWER_CYCLE_RATE_LIMIT)
+                .unwrap_or(false);
+            if rate_limited {
+                warn!(
+                    "Power-cycle skipped due to rate limit (last at {:?}); continuing to reboot rung",
+                    self.state.last_power_cycle_at
+                );
+            } else {
+                self.state.last_power_cycle_at = Some(now);
+                return LadderAction::PowerCycle;
             }
         }
 
@@ -282,6 +282,29 @@ mod tests {
             ladder.on_connection_failure(now + Duration::seconds(i));
         }
         // 15th failure (index 14) triggers reboot
+        assert_eq!(ladder.state().reboot_timestamps.len(), 1);
+    }
+
+    #[test]
+    fn fifteen_failures_reboot_takes_precedence_over_power_cycle() {
+        let mut ladder = ResilienceLadder::new();
+        let now = t(1_000);
+        // 5 failures within 10 min -> power cycle at failure 5 (t=1004)
+        for i in 0..5 {
+            ladder.on_connection_failure(now + Duration::seconds(i));
+        }
+        assert!(ladder.state().last_power_cycle_at.is_some());
+        // Failures 6-10 shortly after (power-cycle rate limit still active)
+        for i in 0..5 {
+            ladder.on_connection_failure(now + Duration::seconds(5 + i));
+        }
+        // Failures 11-15 spaced so that at failure 15 the power-cycle rate limit
+        // has expired and 5 failures are within the 10-minute window: Rung 3
+        // (reboot) must take precedence over Rung 2 (power cycle).
+        let base = now + Duration::minutes(16);
+        for i in 0..5 {
+            ladder.on_connection_failure(base + Duration::seconds(i));
+        }
         assert_eq!(ladder.state().reboot_timestamps.len(), 1);
     }
 

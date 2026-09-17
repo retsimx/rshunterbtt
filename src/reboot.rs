@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 
 pub fn reboot_host() -> Result<()> {
+    unsafe { libc::sync() };
     let ret = unsafe { libc::reboot(libc::RB_AUTOBOOT) };
     if ret != 0 {
         return Err(anyhow!(

@@ -4,11 +4,11 @@ use tracing::{info, warn};
 
 const AF_BLUETOOTH: i32 = 31;
 const BTPROTO_HCI: i32 = 1;
-const HCI_DEV: u16 = 0;
+const HCI_DEV_NONE: u16 = 0xffff;
 const HCI_CHANNEL_MONITOR: u16 = 1;
 
 const HCI_MON_HDR_SIZE: usize = 6;
-const HCI_MON_EVENT_PKT: u16 = 7;
+const HCI_MON_EVENT_PKT: u16 = 3;
 
 const HCI_EVENT_DISCONNECTION_COMPLETE: u8 = 0x05;
 const HCI_EVENT_COMMAND_STATUS: u8 = 0x0f;
@@ -38,7 +38,7 @@ fn open_hci_monitor_socket() -> Result<RawFd> {
     }
     let addr = SockaddrHci {
         family: AF_BLUETOOTH as u16,
-        dev: HCI_DEV,
+        dev: HCI_DEV_NONE,
         channel: HCI_CHANNEL_MONITOR,
     };
     let ret = unsafe {

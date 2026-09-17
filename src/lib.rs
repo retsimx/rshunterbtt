@@ -454,7 +454,7 @@ async fn handle_connection_failure(
         }
         LadderAction::Reboot => {
             error!(
-                "Connection setup failed ({} consecutive failures): rebooting host",
+                "Connection setup failed ({} consecutive failures, rung 3): rebooting host",
                 count
             );
             if let Err(se) = store.save(ladder.state()) {
@@ -465,7 +465,7 @@ async fn handle_connection_failure(
             }
         }
         LadderAction::KeepRetrying => {
-            warn!(
+            error!(
                 "Connection setup failed ({} consecutive failures): 24h reboot cap reached; keep retrying",
                 count
             );
