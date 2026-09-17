@@ -2,12 +2,16 @@
 mod tests {
     use crate::config::Config;
     use crate::protocol::{Second82Protocol, Second83Protocol};
-    use crate::traits::{MockBleClient, MockDatabaseWriter, MockMqttClient};
+    use crate::resilience::{ResilienceLadder, ResilienceStateStore};
+    use crate::traits::{
+        MockBleClient, MockDatabaseWriter, MockMqttClient, MockResilienceController,
+    };
     use crate::App;
     use crate::{
-        next_backoff, run_battery_polling_loop, run_connection_supervisor, BatteryPollingGuard,
-        BatteryPollingIntervals, INITIAL_BACKOFF,
+        handle_connection_failure, next_backoff, run_battery_polling_loop,
+        run_connection_supervisor, BatteryPollingGuard, BatteryPollingIntervals, INITIAL_BACKOFF,
     };
+    use anyhow::anyhow;
     use mockall::predicate;
     use mockall::predicate::*;
     use mockall::PredicateBooleanExt;
@@ -560,12 +564,20 @@ mod tests {
 
         let supervisor_ble = ble.clone();
         let supervisor_config = config;
+        let controller = Arc::new(MockResilienceController::new());
+        let store = ResilienceStateStore::with_path(std::env::temp_dir().join(format!(
+            "rshunterbtt-sup-{}-{}.json",
+            std::process::id(),
+            connect_count.load(Ordering::SeqCst)
+        )));
         tokio::spawn(run_connection_supervisor(
             supervisor_ble,
             supervisor_config,
             stop_rx,
             ready_tx,
             status_tx,
+            controller,
+            store,
         ));
 
         wait_until(|| connect_count.load(Ordering::SeqCst) >= 1 && *ready_check.borrow()).await;
@@ -593,5 +605,106 @@ mod tests {
 
         let _ = stop_tx.send(true);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    fn temp_state_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rshunterbtt-{}-{}.json", name, std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn test_ladder_power_cycles_once_then_rate_limited() {
+        let mut controller = MockResilienceController::new();
+        let power_cycle_count = Arc::new(AtomicUsize::new(0));
+        let pc = power_cycle_count.clone();
+        controller.expect_power_cycle_adapter().returning(move || {
+            pc.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        controller
+            .expect_reboot_host()
+            .returning(|| Box::pin(async { Ok(()) }));
+
+        let path = temp_state_path("powercycle");
+        let store = ResilienceStateStore::with_path(&path);
+        let mut ladder = ResilienceLadder::new();
+        let err = anyhow!("connect failed");
+
+        for _ in 0..5 {
+            handle_connection_failure(
+                &mut ladder,
+                &controller,
+                &store,
+                &err,
+                Duration::from_secs(1),
+            )
+            .await;
+        }
+        assert_eq!(
+            power_cycle_count.load(Ordering::SeqCst),
+            1,
+            "exactly one power cycle after 5 consecutive failures"
+        );
+
+        // 6th failure occurs within the power-cycle rate-limit window -> no 2nd call.
+        handle_connection_failure(
+            &mut ladder,
+            &controller,
+            &store,
+            &err,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            power_cycle_count.load(Ordering::SeqCst),
+            1,
+            "6th failure within rate-limit window must not power cycle again"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_ladder_reboots_after_15_failures_and_persists() {
+        let mut controller = MockResilienceController::new();
+        let reboot_count = Arc::new(AtomicUsize::new(0));
+        let rc = reboot_count.clone();
+        controller.expect_reboot_host().returning(move || {
+            rc.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        controller
+            .expect_power_cycle_adapter()
+            .returning(|| Box::pin(async { Ok(()) }));
+
+        let path = temp_state_path("reboot");
+        let store = ResilienceStateStore::with_path(&path);
+        let mut ladder = ResilienceLadder::new();
+        let err = anyhow!("connect failed");
+
+        for _ in 0..15 {
+            handle_connection_failure(
+                &mut ladder,
+                &controller,
+                &store,
+                &err,
+                Duration::from_secs(1),
+            )
+            .await;
+        }
+        assert_eq!(
+            reboot_count.load(Ordering::SeqCst),
+            1,
+            "reboot after 15 failures"
+        );
+
+        // State must be persisted (write+flush+fsync) before the reboot.
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.reboot_timestamps.len(),
+            1,
+            "reboot timestamp persisted"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
