@@ -558,17 +558,11 @@ async fn run_connection_setup(
     ble_client.connect(&config.device_address).await?;
     info!("Connection established with {}.", config.device_address);
 
-    // The peripheral sends an L2CAP Connection Parameter Update Request on its
-    // *first* connection after boot (requesting a fast ~48-56ms interval), which
-    // BlueZ honours and which reverts/overrides our requested interval. On a
-    // *reconnect* the peripheral leaves the interval alone. So do a
-    // connect -> disconnect -> connect dance: the second connection is the one
-    // on which our interval request will stick.
-    ble_client.disconnect().await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    ble_client.connect(&config.device_address).await?;
-    info!("Reconnected to {}.", config.device_address);
-
+    // The peripheral sends an L2CAP Connection Parameter Update Request shortly
+    // after connecting (requesting a fast ~48-56ms interval), which BlueZ
+    // honours and which reverts our requested interval. The interval guard
+    // (hci_monitor) watches the controller's event stream for that and
+    // re-applies the configured value, so no reconnect dance is needed here.
     if let Err(e) = crate::hci::request_interval(&config.device_address, config.conn_interval_ms) {
         warn!(
             "Failed to request {}ms connection interval: {}",

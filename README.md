@@ -250,10 +250,8 @@ peripheral's advertised preferred parameters, not the `main.conf` defaults.
 
 The Hunter BTT peripheral re-negotiates the interval back towards ~50ms shortly
 after connecting (and intermittently afterwards), which BlueZ honours. The
-bridge handles this two ways: connection setup deliberately connects,
-disconnects, and reconnects — the peripheral only re-negotiates on its first
-connection after boot — and the interval guard re-applies the configured value
-whenever it observes the interval drift away from target.
+interval guard watches the controller's event stream and re-applies the
+configured value whenever the peripheral pulls the interval away from target.
 
 Keep BlueZ's default connection parameters in `/etc/bluetooth/main.conf` in
 sync with `CONN_INTERVAL_MS` as a fallback for when the runtime request is

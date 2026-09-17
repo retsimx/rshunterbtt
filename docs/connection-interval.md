@@ -1,7 +1,7 @@
 # BLE connection interval: latency, the peripheral's re-negotiation, and enforcement
 
 **Status**: deployed (2026-09-17) — `CONN_INTERVAL_MS=1000` on all 3 hosts,
-with a connect/disconnect/connect dance and an event-driven interval guard.
+with an event-driven interval guard.
 **Scope**: `rshunterbtt` (`src/hci.rs`, `src/hci_monitor.rs`, `src/lib.rs`).
 
 Relates to: [architecture](architecture.md) (persistent connection model),
@@ -55,15 +55,11 @@ revert. Latency — not the log line — is the source of truth.
 
 ## The fix
 
-### 1. connect → disconnect → connect dance
+The peripheral sends its request shortly after connecting; the bridge relies on
+a single mechanism to hold the interval — an event-driven guard that catches
+the re-negotiation and re-applies the configured value.
 
-The peripheral sends the L2CAP request on its **first** connection after boot;
-on a **reconnect** it does not. `run_connection_setup` therefore connects,
-disconnects, and reconnects, then applies the interval. `btmon` shows only
-BlueZ's own 195 ms step and then the bridge's target on the second connection,
-with no peripheral request.
-
-### 2. Event-driven interval guard (`hci_monitor`)
+### Event-driven interval guard (`hci_monitor`)
 
 The bridge opens an `HCI_CHANNEL_MONITOR` socket, decodes
 `LE Connection Update Complete` events, and whenever the reported interval is

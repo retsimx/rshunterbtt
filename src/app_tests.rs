@@ -721,10 +721,8 @@ mod tests {
             store,
         ));
 
-        // The connect -> disconnect -> connect dance calls connect() twice
-        // per connection setup.
-        wait_until(|| connect_count.load(Ordering::SeqCst) >= 2 && *ready_check.borrow()).await;
-        assert_eq!(connect_count.load(Ordering::SeqCst), 2);
+        wait_until(|| connect_count.load(Ordering::SeqCst) >= 1 && *ready_check.borrow()).await;
+        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
         assert_eq!(write_pw_count.load(Ordering::SeqCst), 1);
         assert_eq!(subscribe_count.load(Ordering::SeqCst), 1);
 
@@ -733,14 +731,14 @@ mod tests {
         }
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
-            2,
+            1,
             "no reconnect should occur while connection is ready"
         );
 
         disconnect_pending.store(true, Ordering::SeqCst);
 
         wait_until(|| {
-            connect_count.load(Ordering::SeqCst) >= 4
+            connect_count.load(Ordering::SeqCst) >= 2
                 && write_pw_count.load(Ordering::SeqCst) >= 2
                 && subscribe_count.load(Ordering::SeqCst) >= 2
                 && read_zone1_count.load(Ordering::SeqCst) >= 2
@@ -1015,7 +1013,7 @@ mod tests {
 
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
-            2,
+            1,
             "zone name read failure must not tear down the connection or reconnect"
         );
 
