@@ -34,6 +34,7 @@ mod tests {
             influxdb_org: "org".to_string(),
             influxdb_bucket: "bucket".to_string(),
             device_password: None,
+            default_run_seconds: 7200,
         }
     }
 
@@ -288,6 +289,126 @@ mod tests {
         let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
 
         let payload = r#"{"cmd":"on_off","zone":"flower","on_off":false}"#;
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_on_off_true_with_duration_seconds_runs_30_minutes() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        ble.expect_is_connected()
+            .returning(|| Box::pin(async { true }));
+        ble.expect_read_protocol_83()
+            .returning(|| Box::pin(async { Ok(Second83Protocol::default()) }));
+        ble.expect_read_status()
+            .returning(|| Box::pin(async { Ok(vec![0; 20]) }));
+
+        // 1800s = 0h 30m 0s
+        ble.expect_write_protocol_86()
+            .withf(|p| p.zm_hour == 0 && p.zm_minute == 30 && p.zm_second == 0)
+            .returning(|_| Box::pin(async { Ok(()) }));
+
+        ble.expect_write_protocol_83()
+            .withf(|p| p.zone1_enable_manual == 1)
+            .returning(|_| Box::pin(async { Ok(()) }));
+
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""success":true"#)
+                    .and(predicate::str::contains("duration_seconds").not()),
+            )
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
+
+        let payload = r#"{"cmd":"on_off","zone":"flower","on_off":true,"duration_seconds":1800}"#;
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_on_off_true_without_duration_uses_default_run_seconds() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        ble.expect_is_connected()
+            .returning(|| Box::pin(async { true }));
+        ble.expect_read_protocol_83()
+            .returning(|| Box::pin(async { Ok(Second83Protocol::default()) }));
+        ble.expect_read_status()
+            .returning(|| Box::pin(async { Ok(vec![0; 20]) }));
+
+        // default_run_seconds = 7200 -> 2h 0m 0s
+        ble.expect_write_protocol_86()
+            .withf(|p| p.zm_hour == 2 && p.zm_minute == 0 && p.zm_second == 0)
+            .returning(|_| Box::pin(async { Ok(()) }));
+
+        ble.expect_write_protocol_83()
+            .withf(|p| p.zone1_enable_manual == 1)
+            .returning(|_| Box::pin(async { Ok(()) }));
+
+        mqtt.expect_publish()
+            .with(eq("pub"), predicate::str::contains(r#""success":true"#))
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
+
+        let payload = r#"{"cmd":"on_off","zone":"flower","on_off":true}"#;
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_on_off_true_with_out_of_range_duration_yields_success_false() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        ble.expect_is_connected()
+            .returning(|| Box::pin(async { true }));
+        ble.expect_read_protocol_83()
+            .returning(|| Box::pin(async { Ok(Second83Protocol::default()) }));
+        ble.expect_read_status()
+            .returning(|| Box::pin(async { Ok(vec![0; 20]) }));
+
+        // No write_protocol_86 expected: overflow returns Ok(false) before any write.
+        mqtt.expect_publish()
+            .with(eq("pub"), predicate::str::contains(r#""success":false"#))
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
+
+        let payload =
+            r#"{"cmd":"on_off","zone":"flower","on_off":true,"duration_seconds":999999999}"#;
+        app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_on_off_false_with_duration_stops_immediately() {
+        let mut ble = MockBleClient::new();
+        let mut mqtt = MockMqttClient::new();
+        let db = MockDatabaseWriter::new();
+
+        ble.expect_is_connected()
+            .returning(|| Box::pin(async { true }));
+        ble.expect_read_protocol_83()
+            .returning(|| Box::pin(async { Ok(Second83Protocol::default()) }));
+        ble.expect_read_status()
+            .returning(|| Box::pin(async { Ok(vec![0; 20]) }));
+
+        ble.expect_write_protocol_83()
+            .withf(|p| p.zone1_enable_manual == 0)
+            .returning(|_| Box::pin(async { Ok(()) }));
+
+        mqtt.expect_publish()
+            .with(eq("pub"), predicate::str::contains(r#""success":true"#))
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db));
+
+        let payload = r#"{"cmd":"on_off","zone":"flower","on_off":false,"duration_seconds":3600}"#;
         app.handle_mqtt_message(payload.as_bytes()).await.unwrap();
     }
 
