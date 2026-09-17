@@ -9,6 +9,7 @@ use mockall::automock;
 #[cfg_attr(any(test, feature = "mockall"), automock)]
 pub trait BleClient: Send + Sync {
     async fn connect(&self, address: &str) -> Result<()>;
+    async fn disconnect(&self) -> Result<()>;
     async fn is_connected(&self) -> bool;
     async fn read_protocol_83(&self) -> Result<Second83Protocol>;
     async fn read_status(&self) -> Result<Vec<u8>>;

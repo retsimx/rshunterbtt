@@ -113,6 +113,16 @@ impl BleClient for BtleplugClient {
         }
     }
 
+    async fn disconnect(&self) -> Result<()> {
+        let mut lock = self.peripheral.lock().await;
+        if let Some(p) = lock.take() {
+            if let Err(e) = p.disconnect().await {
+                debug!("disconnect returned error (ignored): {}", e);
+            }
+        }
+        Ok(())
+    }
+
     async fn read_protocol_83(&self) -> Result<Second83Protocol> {
         let p = self.get_peripheral().await?;
         let char = self

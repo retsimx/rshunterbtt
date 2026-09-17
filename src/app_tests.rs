@@ -647,6 +647,8 @@ mod tests {
             cc.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         });
+        ble.expect_disconnect()
+            .returning(|| Box::pin(async { Ok(()) }));
 
         let wc = write_pw_count.clone();
         ble.expect_write_password().returning(move |_| {
@@ -719,8 +721,10 @@ mod tests {
             store,
         ));
 
-        wait_until(|| connect_count.load(Ordering::SeqCst) >= 1 && *ready_check.borrow()).await;
-        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+        // The connect -> disconnect -> connect dance calls connect() twice
+        // per connection setup.
+        wait_until(|| connect_count.load(Ordering::SeqCst) >= 2 && *ready_check.borrow()).await;
+        assert_eq!(connect_count.load(Ordering::SeqCst), 2);
         assert_eq!(write_pw_count.load(Ordering::SeqCst), 1);
         assert_eq!(subscribe_count.load(Ordering::SeqCst), 1);
 
@@ -729,14 +733,14 @@ mod tests {
         }
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
-            1,
+            2,
             "no reconnect should occur while connection is ready"
         );
 
         disconnect_pending.store(true, Ordering::SeqCst);
 
         wait_until(|| {
-            connect_count.load(Ordering::SeqCst) >= 2
+            connect_count.load(Ordering::SeqCst) >= 4
                 && write_pw_count.load(Ordering::SeqCst) >= 2
                 && subscribe_count.load(Ordering::SeqCst) >= 2
                 && read_zone1_count.load(Ordering::SeqCst) >= 2
@@ -891,6 +895,8 @@ mod tests {
 
         ble.expect_connect()
             .returning(|_| Box::pin(async { Ok(()) }));
+        ble.expect_disconnect()
+            .returning(|| Box::pin(async { Ok(()) }));
         ble.expect_write_password()
             .returning(|_| Box::pin(async { Ok(()) }));
         ble.expect_subscribe_notifications().returning(|_| {
@@ -958,6 +964,8 @@ mod tests {
             cc.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         });
+        ble.expect_disconnect()
+            .returning(|| Box::pin(async { Ok(()) }));
         ble.expect_write_password()
             .returning(|_| Box::pin(async { Ok(()) }));
         ble.expect_subscribe_notifications().returning(|_| {
@@ -1007,7 +1015,7 @@ mod tests {
 
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
-            1,
+            2,
             "zone name read failure must not tear down the connection or reconnect"
         );
 

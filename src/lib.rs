@@ -558,16 +558,23 @@ async fn run_connection_setup(
     ble_client.connect(&config.device_address).await?;
     info!("Connection established with {}.", config.device_address);
 
+    // The peripheral sends an L2CAP Connection Parameter Update Request on its
+    // *first* connection after boot (requesting a fast ~48-56ms interval), which
+    // BlueZ honours and which reverts/overrides our requested interval. On a
+    // *reconnect* the peripheral leaves the interval alone. So do a
+    // connect -> disconnect -> connect dance: the second connection is the one
+    // on which our interval request will stick.
+    ble_client.disconnect().await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ble_client.connect(&config.device_address).await?;
+    info!("Reconnected to {}.", config.device_address);
+
     if let Err(e) = crate::hci::request_interval(&config.device_address, config.conn_interval_ms) {
         warn!(
             "Failed to request {}ms connection interval: {}",
             config.conn_interval_ms, e
         );
     }
-    // The peripheral re-negotiates shortly after connect (L2CAP Connection
-    // Parameter Update Request), so re-apply our interval over the next minute
-    // to make it reliably stick. See hci::spawn_interval_reapply.
-    crate::hci::spawn_interval_reapply(config.device_address.clone(), config.conn_interval_ms);
 
     let password = build_password(config.device_password.as_deref());
     info!("Writing password to ff81...");
@@ -814,7 +821,17 @@ impl Drop for ConnectionGuard {
 pub async fn run_app() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    crate::hci_monitor::spawn_hci_monitor();
+    // The interval guard watches HCI events for the life of the process, so it
+    // is spawned here (once) from the initial config. The socket is bound
+    // synchronously, guaranteeing it is active before any connection setup
+    // issues an interval update.
+    let config = Config::from_env()?;
+    if !crate::hci_monitor::spawn_hci_monitor(
+        config.device_address.clone(),
+        config.conn_interval_ms,
+    ) {
+        warn!("interval guard unavailable; the connection interval may revert unnoticed");
+    }
 
     loop {
         info!("Starting rshunterbtt...");
