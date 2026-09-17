@@ -564,6 +564,10 @@ async fn run_connection_setup(
             config.conn_interval_ms, e
         );
     }
+    // The peripheral re-negotiates shortly after connect (L2CAP Connection
+    // Parameter Update Request), so re-apply our interval over the next minute
+    // to make it reliably stick. See hci::spawn_interval_reapply.
+    crate::hci::spawn_interval_reapply(config.device_address.clone(), config.conn_interval_ms);
 
     let password = build_password(config.device_password.as_deref());
     info!("Writing password to ff81...");

@@ -25,6 +25,11 @@ const SUPERVISION_TIMEOUT_MS: u16 = 20000;
 const MAX_INTERVAL_RETRIES: usize = 3;
 const INTERVAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// How many times to re-apply the interval after connection setup, and the
+/// period between re-applies (→ 15s, 30s, 45s, 60s after connect).
+const INTERVAL_REAPPLY_ATTEMPTS: usize = 4;
+const INTERVAL_REAPPLY_PERIOD: Duration = Duration::from_secs(15);
+
 fn with_retry<T>(
     attempts: usize,
     delay: Duration,
@@ -312,6 +317,33 @@ pub fn request_interval(device_address: &str, interval_ms: u16) -> Result<()> {
     })();
     unsafe { libc::close(fd) };
     result
+}
+
+/// Re-apply the connection interval periodically after connection setup.
+///
+/// The Hunter BTT peripheral sends an L2CAP Connection Parameter Update
+/// Request shortly after connecting; BlueZ honours it and reverts the interval
+/// we requested (observed: back to 37.5 ms). Re-applying *after* that request
+/// makes the interval stick — but only on connections where the peripheral
+/// does not repeat the request. Re-applying a few times over the first minute
+/// covers the request window for both fresh connections (after reboot) and
+/// reconnects, so the configured interval is reliably in effect.
+pub fn spawn_interval_reapply(device_address: String, interval_ms: u16) {
+    tokio::spawn(async move {
+        for attempt in 1..=INTERVAL_REAPPLY_ATTEMPTS {
+            tokio::time::sleep(INTERVAL_REAPPLY_PERIOD).await;
+            match request_interval(&device_address, interval_ms) {
+                Ok(()) => debug!(
+                    "connection interval re-applied ({}/{})",
+                    attempt, INTERVAL_REAPPLY_ATTEMPTS
+                ),
+                Err(e) => debug!(
+                    "connection interval re-apply {}/{} failed: {}",
+                    attempt, INTERVAL_REAPPLY_ATTEMPTS, e
+                ),
+            }
+        }
+    });
 }
 
 #[cfg(test)]
