@@ -402,7 +402,9 @@ impl Drop for BatteryPollingGuard {
 pub(crate) async fn run_valve_event_observer(
     mut status_cache: StatusCache,
     db_writer: Arc<dyn DatabaseWriter>,
+    mqtt_client: Arc<dyn MqttClient>,
     device_name: String,
+    pub_topic: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut prev: Option<Second82Protocol> = None;
@@ -425,6 +427,7 @@ pub(crate) async fn run_valve_event_observer(
                             {
                                 warn!("Failed to write valve event for zone1: {}", e);
                             }
+                            push_zone_status(&mqtt_client, &pub_topic, "garden", new.zone1_state).await;
                         }
                         if prev.zone2_state != new.zone2_state {
                             if let Err(e) = db_writer
@@ -433,6 +436,7 @@ pub(crate) async fn run_valve_event_observer(
                             {
                                 warn!("Failed to write valve event for zone2: {}", e);
                             }
+                            push_zone_status(&mqtt_client, &pub_topic, "grass", new.zone2_state).await;
                         }
                     }
                     prev = Some(new);
@@ -454,17 +458,44 @@ pub(crate) struct ValveEventObserverGuard {
     task: JoinHandle<()>,
 }
 
+/// Publish a `status` response for a zone on the c2s topic, reflecting a
+/// notification-driven state change (device self-stop, manual button, etc.)
+/// so MQTT consumers (e.g. HA entities) see it without polling.
+/// Zone-name mapping follows the bridge's canonical contract: zone 1 =
+/// "garden", zone 2 = "grass".
+async fn push_zone_status(
+    mqtt_client: &Arc<dyn MqttClient>,
+    pub_topic: &str,
+    zone_name: &str,
+    state: bool,
+) {
+    let payload = serde_json::json!({
+        "cmd": "status",
+        "zone": zone_name,
+        "status": if state { 1 } else { 0 },
+        "ack": true,
+    })
+    .to_string();
+    if let Err(e) = mqtt_client.publish(pub_topic, &payload).await {
+        warn!("Failed to push zone status for {}: {}", zone_name, e);
+    }
+}
+
 impl ValveEventObserverGuard {
     pub(crate) fn start(
         status_cache: StatusCache,
         db_writer: Arc<dyn DatabaseWriter>,
+        mqtt_client: Arc<dyn MqttClient>,
         device_name: String,
+        pub_topic: String,
     ) -> Self {
         let (stop_tx, stop_rx) = watch::channel(false);
         let task = tokio::spawn(run_valve_event_observer(
             status_cache,
             db_writer,
+            mqtt_client,
             device_name,
+            pub_topic,
             stop_rx,
         ));
         Self { stop_tx, task }
@@ -819,7 +850,9 @@ async fn run_app_instance() -> Result<()> {
     let _valve_event_observer = ValveEventObserverGuard::start(
         status_cache_observer,
         db_writer_observer,
+        mqtt_client.clone(),
         config.device_name.clone(),
+        config.mqtt_pub_topic.clone(),
     );
     let _connection = connection_guard;
 

@@ -1037,10 +1037,16 @@ mod tests {
         let (status_tx, status_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish()
+            .times(1..)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
         let handle = tokio::spawn(run_valve_event_observer(
             status_rx,
             Arc::new(db),
+            Arc::new(mqtt),
             "test_device".to_string(),
+            "pub".to_string(),
             shutdown_rx,
         ));
 
@@ -1081,10 +1087,16 @@ mod tests {
         let (status_tx, status_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish()
+            .times(1..)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
         let handle = tokio::spawn(run_valve_event_observer(
             status_rx,
             Arc::new(db),
+            Arc::new(mqtt),
             "test_device".to_string(),
+            "pub".to_string(),
             shutdown_rx,
         ));
 
@@ -1117,10 +1129,14 @@ mod tests {
         let (status_tx, status_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish().times(0);
         let handle = tokio::spawn(run_valve_event_observer(
             status_rx,
             Arc::new(db),
+            Arc::new(mqtt),
             "test_device".to_string(),
+            "pub".to_string(),
             shutdown_rx,
         ));
 
@@ -1151,10 +1167,16 @@ mod tests {
         let (status_tx, status_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish()
+            .times(1..)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
         let handle = tokio::spawn(run_valve_event_observer(
             status_rx,
             Arc::new(db),
+            Arc::new(mqtt),
             "test_device".to_string(),
+            "pub".to_string(),
             shutdown_rx,
         ));
 
@@ -1182,10 +1204,14 @@ mod tests {
         let (status_tx, status_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish().times(0);
         let handle = tokio::spawn(run_valve_event_observer(
             status_rx,
             Arc::new(db),
+            Arc::new(mqtt),
             "test_device".to_string(),
+            "pub".to_string(),
             shutdown_rx,
         ));
 
