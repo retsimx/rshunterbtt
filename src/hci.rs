@@ -23,6 +23,28 @@ const HCIGETCONNLIST: libc::c_int = 0x800448d4u32 as libc::c_int;
 
 const TARGET_INTERVAL_MS: u16 = 4000;
 const SUPERVISION_TIMEOUT_MS: u16 = 20000;
+const MAX_INTERVAL_RETRIES: usize = 3;
+const INTERVAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+fn with_retry<T>(
+    attempts: usize,
+    delay: Duration,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut last_err = None;
+    for i in 0..attempts {
+        match attempt() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_err = Some(e);
+                if i + 1 < attempts {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
 
 fn interval_units(ms: u16) -> u16 {
     (ms as u32 * 4 / 5) as u16
@@ -206,65 +228,67 @@ fn find_connection_handle(fd: RawFd, address: &str) -> Result<u16> {
 }
 
 fn request_connection_interval(fd: RawFd, handle: u16) -> Result<u16> {
-    let min = interval_units(TARGET_INTERVAL_MS);
-    let max = min;
-    let timeout = timeout_units(SUPERVISION_TIMEOUT_MS);
-    let mut params = Vec::with_capacity(14);
-    params.extend_from_slice(&handle.to_le_bytes());
-    params.extend_from_slice(&min.to_le_bytes());
-    params.extend_from_slice(&max.to_le_bytes());
-    params.extend_from_slice(&0u16.to_le_bytes());
-    params.extend_from_slice(&timeout.to_le_bytes());
-    params.extend_from_slice(&1u16.to_le_bytes());
-    params.extend_from_slice(&1u16.to_le_bytes());
-    send_hci_command(fd, HCI_LE_CONN_UPDATE, &params)?;
+    with_retry(MAX_INTERVAL_RETRIES, INTERVAL_RETRY_DELAY, || {
+        let min = interval_units(TARGET_INTERVAL_MS);
+        let max = min;
+        let timeout = timeout_units(SUPERVISION_TIMEOUT_MS);
+        let mut params = Vec::with_capacity(14);
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.extend_from_slice(&min.to_le_bytes());
+        params.extend_from_slice(&max.to_le_bytes());
+        params.extend_from_slice(&0u16.to_le_bytes());
+        params.extend_from_slice(&timeout.to_le_bytes());
+        params.extend_from_slice(&1u16.to_le_bytes());
+        params.extend_from_slice(&1u16.to_le_bytes());
+        send_hci_command(fd, HCI_LE_CONN_UPDATE, &params)?;
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
-        let evt = match read_hci_event(fd, Duration::from_secs(2)) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if evt.len() < 2 {
-            continue;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            let evt = match read_hci_event(fd, Duration::from_secs(2)) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if evt.len() < 2 {
+                continue;
+            }
+            match evt[0] {
+                HCI_EVENT_COMMAND_COMPLETE if evt.len() >= 6 => {
+                    let evt_op = evt[3] as u16 | ((evt[4] as u16) << 8);
+                    if evt_op == HCI_LE_CONN_UPDATE && evt[5] != 0 {
+                        return Err(anyhow!(
+                            "LE conn update command complete status: 0x{:02x}",
+                            evt[5]
+                        ));
+                    }
+                }
+                HCI_EVENT_COMMAND_STATUS if evt.len() >= 6 => {
+                    let evt_op = evt[4] as u16 | ((evt[5] as u16) << 8);
+                    if evt_op == HCI_LE_CONN_UPDATE && evt[2] != 0 {
+                        return Err(anyhow!("LE conn update command status: 0x{:02x}", evt[2]));
+                    }
+                }
+                HCI_EVENT_LE_META
+                    if evt.len() >= 8 && evt[2] == LE_SUBEVENT_CONNECTION_UPDATE_COMPLETE =>
+                {
+                    let status = evt[3];
+                    let evt_handle = u16::from_le_bytes([evt[4], evt[5]]);
+                    let interval = u16::from_le_bytes([evt[6], evt[7]]);
+                    if evt_handle != handle {
+                        continue;
+                    }
+                    if status != 0 {
+                        return Err(anyhow!(
+                            "device rejected connection update: status 0x{:02x}",
+                            status
+                        ));
+                    }
+                    return Ok(interval);
+                }
+                _ => {}
+            }
         }
-        match evt[0] {
-            HCI_EVENT_COMMAND_COMPLETE if evt.len() >= 6 => {
-                let evt_op = evt[3] as u16 | (evt[4] as u16) << 8;
-                if evt_op == HCI_LE_CONN_UPDATE && evt[5] != 0 {
-                    return Err(anyhow!(
-                        "LE conn update command complete status: 0x{:02x}",
-                        evt[5]
-                    ));
-                }
-            }
-            HCI_EVENT_COMMAND_STATUS if evt.len() >= 6 => {
-                let evt_op = evt[4] as u16 | (evt[5] as u16) << 8;
-                if evt_op == HCI_LE_CONN_UPDATE && evt[2] != 0 {
-                    return Err(anyhow!("LE conn update command status: 0x{:02x}", evt[2]));
-                }
-            }
-            HCI_EVENT_LE_META
-                if evt.len() >= 8 && evt[2] == LE_SUBEVENT_CONNECTION_UPDATE_COMPLETE =>
-            {
-                let status = evt[3];
-                let evt_handle = u16::from_le_bytes([evt[4], evt[5]]);
-                let interval = u16::from_le_bytes([evt[6], evt[7]]);
-                if evt_handle != handle {
-                    continue;
-                }
-                if status != 0 {
-                    return Err(anyhow!(
-                        "device rejected connection update: status 0x{:02x}",
-                        status
-                    ));
-                }
-                return Ok(interval);
-            }
-            _ => {}
-        }
-    }
-    Err(anyhow!("timed out waiting for connection update result"))
+        Err(anyhow!("timed out waiting for connection update result"))
+    })
 }
 
 pub fn request_4000ms_interval(device_address: &str) -> Result<()> {
@@ -301,5 +325,31 @@ mod tests {
         assert_eq!(timeout_units(20000), 2000);
         assert_eq!(timeout_units(10000), 1000);
         assert_eq!(timeout_units(3000), 300);
+    }
+
+    #[test]
+    fn test_with_retry_succeeds_after_rejections() {
+        let mut calls = 0;
+        let result = with_retry(3, Duration::from_millis(1), || {
+            calls += 1;
+            if calls < 3 {
+                Err(anyhow!("rejected"))
+            } else {
+                Ok(42u16)
+            }
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn test_with_retry_gives_up_after_cap() {
+        let mut calls = 0;
+        let result = with_retry(3, Duration::from_millis(1), || {
+            calls += 1;
+            Err::<u16, _>(anyhow!("rejected"))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 3);
     }
 }
