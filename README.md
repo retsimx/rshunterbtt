@@ -38,6 +38,9 @@ MQTT_PORT=1883
 MQTT_SUB_TOPIC=irrigation/s2c/rear/#
 MQTT_PUB_TOPIC=irrigation/c2s/rear
 
+# Run-duration failsafe (seconds)
+# DEFAULT_RUN_SECONDS=7200
+
 # InfluxDB Configuration
 INFLUXDB_URL=http://10.0.25.10:8086
 INFLUXDB_TOKEN=your_token_here
@@ -60,11 +63,31 @@ OEM default** — a repo-wide search of decompiled OEM sources found no
 hardcoded factory-default password. If your device requires a password,
 set `DEVICE_PASSWORD` explicitly.
 
+### Run-duration failsafe (`DEFAULT_RUN_SECONDS`)
+
+`DEFAULT_RUN_SECONDS` sets the default run duration (in seconds) used
+when an `on_off` start command does not specify a `duration_seconds`.
+The default is `7200` (2 hours). It acts as a failsafe so a start
+command without an explicit duration still stops the zone after a
+bounded time.
+
 ## MQTT Interface
 
 ### Commands (S2C)
 Topic: `irrigation/s2c/<device_name>/<zone>`
 Payload: `{"cmd": "on_off", "zone": "grass", "on_off": true}`
+
+The `on_off` command accepts an optional `duration_seconds` field:
+
+- `duration_seconds` specifies the run duration (in seconds) when
+  `on_off` is `true`. If omitted, the run duration falls back to
+  `DEFAULT_RUN_SECONDS` (default `7200`).
+- It is ignored when `on_off` is `false` — stop remains immediate.
+- A value that cannot be represented in the device's byte-field
+  encoding (i.e. it overflows the field) returns `success: false`.
+
+Example with an explicit duration:
+`{"cmd": "on_off", "zone": "grass", "on_off": true, "duration_seconds": 1800}`
 
 ### Status (S2C)
 Topic: `irrigation/s2c/<device_name>/status`

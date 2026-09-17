@@ -19,6 +19,7 @@ fn mock_config() -> Config {
         influxdb_org: "org".to_string(),
         influxdb_bucket: "bucket".to_string(),
         device_password: None,
+        default_run_seconds: 7200,
     }
 }
 

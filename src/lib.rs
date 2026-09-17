@@ -42,6 +42,7 @@ pub struct MqttCommand {
     pub cmd: String,
     pub zone: String,
     pub on_off: Option<bool>,
+    pub duration_seconds: Option<u32>,
     #[serde(flatten)]
     pub extra: serde_json::Value,
 }
@@ -153,6 +154,9 @@ impl App {
 
         match cmd {
             "start" => {
+                if run_time_secs / 3600 > u8::MAX as u32 {
+                    return Ok(false);
+                }
                 let hours = (run_time_secs / 3600) as u8;
                 let minutes = ((run_time_secs % 3600) / 60) as u8;
                 let seconds = (run_time_secs % 60) as u8;
@@ -237,9 +241,14 @@ impl App {
             "on_off" => {
                 if let Some(on) = msg.on_off {
                     let success = if on {
-                        self.run_command("start", zone_id, 2 * 3600).await.is_ok()
+                        let duration = msg
+                            .duration_seconds
+                            .unwrap_or(self.config.default_run_seconds);
+                        self.run_command("start", zone_id, duration)
+                            .await
+                            .unwrap_or(false)
                     } else {
-                        self.run_command("stop", zone_id, 0).await.is_ok()
+                        self.run_command("stop", zone_id, 0).await.unwrap_or(false)
                     };
                     response.success = Some(success);
                 }
