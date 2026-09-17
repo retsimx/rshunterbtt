@@ -28,6 +28,14 @@ use tracing::{error, info, warn};
 
 pub(crate) type StatusCache = watch::Receiver<Option<Second82Protocol>>;
 pub(crate) type StatusCacheSender = watch::Sender<Option<Second82Protocol>>;
+pub(crate) type ZoneNamesCache = watch::Receiver<Option<ZoneNames>>;
+pub(crate) type ZoneNamesCacheSender = watch::Sender<Option<ZoneNames>>;
+
+#[derive(Debug, Clone, Default)]
+pub struct ZoneNames {
+    pub zone1: Option<String>,
+    pub zone2: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct MqttCommand {
@@ -61,6 +69,7 @@ pub struct App {
     connection_ready: watch::Receiver<bool>,
     status_cache: StatusCache,
     status_tx: StatusCacheSender,
+    zone_names: ZoneNamesCache,
 }
 
 impl App {
@@ -72,6 +81,7 @@ impl App {
     ) -> Self {
         let (_, ready_rx) = watch::channel(true);
         let (status_tx, status_rx) = watch::channel(None);
+        let (_, zone_names_rx) = watch::channel(None);
         Self {
             config,
             ble_client,
@@ -80,6 +90,7 @@ impl App {
             connection_ready: ready_rx,
             status_cache: status_rx,
             status_tx,
+            zone_names: zone_names_rx,
         }
     }
 
@@ -95,6 +106,11 @@ impl App {
     ) -> Self {
         self.status_cache = status_cache;
         self.status_tx = status_tx;
+        self
+    }
+
+    pub fn with_zone_names(mut self, zone_names: ZoneNamesCache) -> Self {
+        self.zone_names = zone_names;
         self
     }
 
@@ -239,6 +255,17 @@ impl App {
                     .unwrap_or(false);
                 if let Some(obj) = response.extra.as_object_mut() {
                     obj.insert("suspend_watering".to_string(), serde_json::json!(suspend));
+                }
+                let zone_names = self.zone_names.borrow().clone();
+                if let Some(names) = zone_names {
+                    if let Some(obj) = response.extra.as_object_mut() {
+                        if let Some(name) = names.zone1 {
+                            obj.insert("zone1_name".to_string(), serde_json::json!(name));
+                        }
+                        if let Some(name) = names.zone2 {
+                            obj.insert("zone2_name".to_string(), serde_json::json!(name));
+                        }
+                    }
                 }
             }
             _ => {
@@ -480,12 +507,14 @@ async fn handle_connection_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_connection_supervisor(
     ble_client: Arc<dyn BleClient>,
     config: Config,
     mut shutdown: watch::Receiver<bool>,
     ready_tx: watch::Sender<bool>,
     status_tx: StatusCacheSender,
+    zone_names_tx: ZoneNamesCacheSender,
     controller: Arc<dyn ResilienceController>,
     store: ResilienceStateStore,
 ) {
@@ -508,6 +537,21 @@ pub(crate) async fn run_connection_supervisor(
                 backoff = INITIAL_BACKOFF;
                 let _ = status_tx.send(None);
                 let _ = ready_tx.send(true);
+                let zone1 = match ble_client.read_zone1_name().await {
+                    Ok(name) => Some(name),
+                    Err(e) => {
+                        warn!("Failed to read zone 1 name: {}", e);
+                        None
+                    }
+                };
+                let zone2 = match ble_client.read_zone2_name().await {
+                    Ok(name) => Some(name),
+                    Err(e) => {
+                        warn!("Failed to read zone 2 name: {}", e);
+                        None
+                    }
+                };
+                let _ = zone_names_tx.send(Some(ZoneNames { zone1, zone2 }));
                 spawn_notification_consumer(notif_rx, status_tx.clone(), shutdown.clone());
                 if wait_for_disconnect_or_shutdown(&mut shutdown, &ble_client).await {
                     break;
@@ -570,10 +614,17 @@ impl ConnectionGuard {
         ble_client: Arc<dyn BleClient>,
         config: Config,
         controller: Arc<dyn ResilienceController>,
-    ) -> (Self, watch::Receiver<bool>, StatusCache, StatusCacheSender) {
+    ) -> (
+        Self,
+        watch::Receiver<bool>,
+        StatusCache,
+        StatusCacheSender,
+        ZoneNamesCache,
+    ) {
         let (stop_tx, stop_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(None);
+        let (zone_names_tx, zone_names_rx) = watch::channel(None);
         let store = ResilienceStateStore::new(&config.device_name);
         let task = tokio::spawn(run_connection_supervisor(
             ble_client,
@@ -581,10 +632,17 @@ impl ConnectionGuard {
             stop_rx,
             ready_tx,
             status_tx.clone(),
+            zone_names_tx,
             controller,
             store,
         ));
-        (Self { stop_tx, task }, ready_rx, status_rx, status_tx)
+        (
+            Self { stop_tx, task },
+            ready_rx,
+            status_rx,
+            status_tx,
+            zone_names_rx,
+        )
     }
 }
 
@@ -636,11 +694,12 @@ async fn run_app_instance() -> Result<()> {
     );
 
     let controller = Arc::new(crate::dbus_control::SystemResilienceController::default());
-    let (connection_guard, connection_ready, status_cache, status_tx) =
+    let (connection_guard, connection_ready, status_cache, status_tx, zone_names) =
         ConnectionGuard::start(ble_client, config.clone(), controller);
     let app = Arc::new(
         app.with_connection_ready(connection_ready)
-            .with_status_cache(status_cache, status_tx),
+            .with_status_cache(status_cache, status_tx)
+            .with_zone_names(zone_names),
     );
 
     let _battery_polling =

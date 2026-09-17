@@ -6,6 +6,16 @@ pub fn protocol_id_to_uuid(protocol_id: u16) -> String {
     format!("{:08x}-0000-1000-8000-00805f9b34fb", protocol_id)
 }
 
+pub fn decode_zone_name(data: &[u8]) -> Result<String> {
+    let end = data.iter().position(|&b| b == 0x00).unwrap_or(data.len());
+    let name = &data[..end.min(20)];
+    if name.is_empty() {
+        return Err(anyhow!("Zone name is empty"));
+    }
+    let s = std::str::from_utf8(name)?;
+    Ok(s.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Second86Protocol {
     pub w_index: u8,
@@ -244,5 +254,24 @@ mod tests {
         let bytes = original.to_bytes();
         let decoded = Second86Protocol::from_bytes(&bytes).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_decode_zone_name_normal() {
+        let data = b"Front Lawn\x00\x00\x00";
+        assert_eq!(decode_zone_name(data).unwrap(), "Front Lawn");
+    }
+
+    #[test]
+    fn test_decode_zone_name_empty() {
+        assert!(decode_zone_name(&[]).is_err());
+        assert!(decode_zone_name(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn test_decode_zone_name_null_padded() {
+        let mut data = vec![0u8; 20];
+        data[..9].copy_from_slice(b"Back Yard");
+        assert_eq!(decode_zone_name(&data).unwrap(), "Back Yard");
     }
 }
