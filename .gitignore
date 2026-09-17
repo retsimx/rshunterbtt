@@ -9,6 +9,13 @@
 .idea/
 .vscode/
 
+# Internal planning artifacts (not published)
+docs/plans/
+
+# Local agent tooling / scratch (may contain environment-specific notes)
+.agents/
+err*.txt
+
 # Python leftovers (if any)
 venv/
 __pycache__/

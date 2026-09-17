@@ -36,6 +36,20 @@ The project supports multiple controllers across different Raspberry Pi devices:
 - **Front Controller**: `18:04:ED:56:9F:71` (Deployed on `bedroompiw`)
 - **Front Small Controller**: `F4:60:77:2F:3F:78` (Deployed on `frontpiw`)
 
+## Documentation
+
+Reference notes on the protocol and design live in [`docs/`](docs/README.md):
+
+- [Advertising vs GATT](docs/protocol/advertising-vs-gatt.md) — why status is GATT-only
+- [GATT profile](docs/protocol/gatt-profile.md) — services, characteristics, notifications
+- [AIS protocol](docs/protocol/ais-protocol.md) — framing, command IDs, the zone-state enum
+- [Architecture](docs/architecture.md) — the persistent-connection design
+- [Connection interval](docs/connection-interval.md) — latency vs battery, and the interval guard
+- [Battery life](docs/battery-life.md) — real-world figures from InfluxDB
+- [HA integration](docs/ha-integration.md) — protocol features for a home-automation consumer
+- [Integration strategy](docs/integration-strategy.md) — the decision record
+- [Protocol coverage and gaps](docs/gaps.md) — what is and isn't implemented
+
 ## Configuration
 
 Configuration is managed via a `.env` file in the working directory:
