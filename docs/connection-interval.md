@@ -93,10 +93,8 @@ Corrections settle (typically 1–2 per connection); no ping-pong observed.
 ## Configuration
 
 - **`CONN_INTERVAL_MS`** (default `4000`, BLE range 8–4000). The bridge requests
-  it (with retry) and the guard re-asserts it on every revert.
-- **`/etc/bluetooth/main.conf`** `[LE] Min/MaxConnectionInterval` — the fallback
-  when the runtime request fails. Units are 1.25 ms: use `interval_ms × 0.8`
-  (`1000 ms → 800`). Keep it in sync with `CONN_INTERVAL_MS`.
+  it (with retry) and the guard re-asserts it on every revert. This is the only
+  knob: the interval is set per connection at runtime.
 
 ## Deployment decision
 
@@ -104,7 +102,7 @@ Corrections settle (typically 1–2 per connection); no ping-pong observed.
 connection events than 4000 ms and 16× fewer than the OEM's 60 ms**. The
 peripheral actively wants ~48–60 ms; the guard holds 1000 ms against it, so
 the battery benefit is real (not silently lost to a revert). If battery
-regresses, raise the interval (and `main.conf`); if 5 s is too slow, lower it.
+regresses, raise the interval; if 5 s is too slow, lower it.
 The HA `valve` entities remain `optimistic` so the UI is instant regardless.
 
 ## Open items

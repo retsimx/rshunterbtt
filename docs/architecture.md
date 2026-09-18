@@ -28,7 +28,7 @@ with `ff82` notifications is viable:
 - **Connection interval** — configurable via `CONN_INTERVAL_MS`. The 4000ms
   maximum was the original choice for battery (a 66× reduction in connection
   events over the 60ms default), but it costs ~21s per command; the deployment
-  runs at 1000ms with a matching `main.conf` fallback. See
+  runs at 1000ms. See
   [connection interval](connection-interval.md).
 - **Battery** — `2a19` is read on an hourly schedule and written directly to
   InfluxDB.

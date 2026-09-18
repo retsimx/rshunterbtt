@@ -73,9 +73,7 @@ MQTT_PUB_TOPIC=irrigation/c2s/rear
 # command turnaround but more radio connection events (battery drain).
 # Empirical: 60ms -> ~0.5s commands, 1000ms -> ~5s, 4000ms -> ~21s. The
 # Hunter BTT peripheral re-negotiates back to ~48-60ms; the bridge's interval
-# guard (HCI monitor) detects and re-applies this value. Keep
-# /etc/bluetooth/main.conf [LE] Min/MaxConnectionInterval in sync
-# (interval_ms * 0.8).
+# guard (HCI monitor) detects and re-applies this value.
 # CONN_INTERVAL_MS=1000
 
 # InfluxDB Configuration
@@ -240,37 +238,22 @@ cross build --target arm-unknown-linux-musleabihf --release
 
 ## Deployment
 
-### Required host BLE configuration (one-time)
+### Connection interval
 
 The bridge requests its configured connection interval (`CONN_INTERVAL_MS`)
 at runtime via a pure-Rust HCI connection-parameter update (an `LE Connection
 Update` command sent over a raw HCI socket) — no external tools required. This
 is necessary because BlueZ's central-role connection otherwise uses the
-peripheral's advertised preferred parameters, not the `main.conf` defaults.
+peripheral's advertised preferred parameters for the link.
+
+The request is scoped to the bridge's own connection (the HCI handle is
+resolved from `DEVICE_ADDRESS`), so sharing an adapter with other BLE devices
+is safe.
 
 The Hunter BTT peripheral re-negotiates the interval back towards ~50ms shortly
 after connecting (and intermittently afterwards), which BlueZ honours. The
 interval guard watches the controller's event stream and re-applies the
 configured value whenever the peripheral pulls the interval away from target.
-
-Keep BlueZ's default connection parameters in `/etc/bluetooth/main.conf` in
-sync with `CONN_INTERVAL_MS` as a fallback for when the runtime request is
-rejected. The interval fields are in ×1.25ms steps, i.e. `interval_ms × 0.8`
-(so 1000ms → 800). Add to the `[LE]` section:
-
-```ini
-[LE]
-MinConnectionInterval=800
-MaxConnectionInterval=800
-ConnectionLatency=0
-ConnectionSupervisionTimeout=2000
-```
-
-The supervision timeout is in ×10ms steps (`2000 × 10ms = 20000ms`, above the
-mandatory floor of `2×(1+latency)×interval` and within the 32000ms ceiling).
-
-Apply the change with `rc-service bluetooth restart` (Alpine/OpenRC hosts — no
-systemd), then reboot the host so the interval is applied cleanly.
 
 1. Copy the cross-compiled binary to `/root/rshunterbtt/rshunterbtt`.
 2. Create `/root/rshunterbtt/.env` with the correct device settings.
