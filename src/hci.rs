@@ -314,6 +314,16 @@ pub fn request_interval(device_address: &str, interval_ms: u16) -> Result<()> {
     result
 }
 
+/// Resolve the current HCI connection handle for `device_address`, or an error
+/// when the device is not currently connected. Used by the interval guard to
+/// ignore `LE Connection Update Complete` events belonging to other links.
+pub fn resolve_connection_handle(device_address: &str) -> Result<u16> {
+    let fd = open_hci_socket()?;
+    let result = find_connection_handle(fd, device_address);
+    unsafe { libc::close(fd) };
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -150,6 +150,12 @@ fn decode_monitor_packet(data: &[u8], guard: &mut IntervalGuard) {
     }
 }
 
+/// Whether an `LE Connection Update Complete` for `event_handle` belongs to our
+/// connection. `own_handle` is `None` when our device is not connected.
+fn is_own_link(event_handle: u16, own_handle: Option<u16>) -> bool {
+    own_handle == Some(event_handle)
+}
+
 fn decode_hci_event(evt: &[u8], guard: &mut IntervalGuard) {
     if evt.len() < 2 {
         return;
@@ -171,8 +177,17 @@ fn decode_hci_event(evt: &[u8], guard: &mut IntervalGuard) {
         }
         HCI_EVENT_LE_META if evt.len() >= 8 && evt[2] == LE_SUBEVENT_CONNECTION_UPDATE_COMPLETE => {
             // evt[3]=status, evt[4..6]=handle (LE), evt[6..8]=connection interval
+            let event_handle = u16::from_le_bytes([evt[4], evt[5]]);
             let interval = u16::from_le_bytes([evt[6], evt[7]]);
-            guard.enforce(interval);
+            let own_handle = crate::hci::resolve_connection_handle(&guard.device_address).ok();
+            if is_own_link(event_handle, own_handle) {
+                guard.enforce(interval);
+            } else {
+                debug!(
+                    "ignoring interval event for handle {} (not our link)",
+                    event_handle
+                );
+            }
         }
         _ => {}
     }
@@ -272,6 +287,13 @@ mod tests {
         decode_monitor_packet(&event_pkt(&evt), &mut guard());
         let cmd = [0x01u8, 0x05, 0x20, 0x06, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
         decode_monitor_packet(&monitor_frame(2, &cmd), &mut guard());
+    }
+
+    #[test]
+    fn test_is_own_link_filters_other_connections() {
+        assert!(is_own_link(64, Some(64)));
+        assert!(!is_own_link(65, Some(64)));
+        assert!(!is_own_link(64, None));
     }
 
     #[test]
