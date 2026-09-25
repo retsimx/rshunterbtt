@@ -16,6 +16,9 @@ pub struct Config {
     pub device_password: Option<String>,
     pub default_run_seconds: u32,
     pub conn_interval_ms: u16,
+    pub ha_status_topic: Option<String>,
+    pub ha_birth_payload: String,
+    pub state_heartbeat_secs: u64,
 }
 
 impl Config {
@@ -54,6 +57,21 @@ impl Config {
                 }
                 ms
             },
+            ha_status_topic: {
+                let raw = std::env::var("HA_STATUS_TOPIC")
+                    .unwrap_or_else(|_| "homeassistant/status".to_string());
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(raw)
+                }
+            },
+            ha_birth_payload: std::env::var("HA_BIRTH_PAYLOAD")
+                .unwrap_or_else(|_| "online".to_string()),
+            state_heartbeat_secs: std::env::var("STATE_HEARTBEAT_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .context("STATE_HEARTBEAT_SECS must be a number")?,
         };
 
         Ok(config)
@@ -80,6 +98,10 @@ mod tests {
         std::env::set_var("INFLUXDB_BUCKET", "bucket");
         // Optional vars: start each test from a known state.
         std::env::remove_var("CONN_INTERVAL_MS");
+        std::env::remove_var("DEFAULT_RUN_SECONDS");
+        std::env::remove_var("HA_STATUS_TOPIC");
+        std::env::remove_var("HA_BIRTH_PAYLOAD");
+        std::env::remove_var("STATE_HEARTBEAT_SECS");
     }
 
     #[test]
@@ -133,6 +155,86 @@ mod tests {
         std::env::set_var("CONN_INTERVAL_MS", "9999");
         assert!(Config::from_env().is_err());
         std::env::set_var("CONN_INTERVAL_MS", "1");
+        assert!(Config::from_env().is_err());
+    }
+
+    #[test]
+    fn ha_status_topic_defaults_to_homeassistant_status() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.ha_status_topic.as_deref(),
+            Some("homeassistant/status")
+        );
+    }
+
+    #[test]
+    fn ha_status_topic_parses_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("HA_STATUS_TOPIC", "custom/status");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.ha_status_topic.as_deref(), Some("custom/status"));
+    }
+
+    #[test]
+    fn ha_status_topic_empty_disables() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("HA_STATUS_TOPIC", "");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.ha_status_topic, None);
+    }
+
+    #[test]
+    fn ha_birth_payload_defaults_to_online() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.ha_birth_payload, "online");
+    }
+
+    #[test]
+    fn ha_birth_payload_parses_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("HA_BIRTH_PAYLOAD", "ready");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.ha_birth_payload, "ready");
+    }
+
+    #[test]
+    fn state_heartbeat_defaults_to_60_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.state_heartbeat_secs, 60);
+    }
+
+    #[test]
+    fn state_heartbeat_parses_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("STATE_HEARTBEAT_SECS", "15");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.state_heartbeat_secs, 15);
+    }
+
+    #[test]
+    fn state_heartbeat_zero_disables() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("STATE_HEARTBEAT_SECS", "0");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.state_heartbeat_secs, 0);
+    }
+
+    #[test]
+    fn state_heartbeat_fails_when_invalid() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        required_env();
+        std::env::set_var("STATE_HEARTBEAT_SECS", "not_a_number");
         assert!(Config::from_env().is_err());
     }
 }

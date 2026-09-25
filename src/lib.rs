@@ -228,6 +228,30 @@ impl App {
         }
     }
 
+    /// Publish the cached zone states without touching BLE. No-op when the
+    /// cache is cold (BLE down), so consumers fall back to their own expiry.
+    /// Publish failures are logged by `push_zone_status`; there is no error to
+    /// surface here.
+    pub async fn publish_state_snapshot(&self) {
+        let cached = self.status_cache.borrow().clone();
+        if let Some(p) = cached {
+            push_zone_status(
+                &self.mqtt_client,
+                &self.config.mqtt_pub_topic,
+                "garden",
+                p.zone1_state,
+            )
+            .await;
+            push_zone_status(
+                &self.mqtt_client,
+                &self.config.mqtt_pub_topic,
+                "grass",
+                p.zone2_state,
+            )
+            .await;
+        }
+    }
+
     pub async fn handle_mqtt_message(&self, payload: &[u8]) -> Result<()> {
         let msg: MqttCommand = serde_json::from_slice(payload)?;
         info!("Received MQTT command: {:?}", msg);
@@ -429,24 +453,35 @@ pub(crate) async fn run_valve_event_observer(
                 }
                 let new = status_cache.borrow().clone();
                 if let Some(new) = new {
-                    if let Some(prev) = &prev {
-                        if prev.zone1_state != new.zone1_state {
-                            if let Err(e) = db_writer
-                                .write_valve_event(&device_name, "zone1", new.zone1_state)
-                                .await
-                            {
-                                warn!("Failed to write valve event for zone1: {}", e);
-                            }
+                    match &prev {
+                        // Baseline (first state after a (re)connect): publish
+                        // both zones so consumers converge, but do not record a
+                        // valve event because no transition occurred.
+                        None => {
                             push_zone_status(&mqtt_client, &pub_topic, "garden", new.zone1_state).await;
-                        }
-                        if prev.zone2_state != new.zone2_state {
-                            if let Err(e) = db_writer
-                                .write_valve_event(&device_name, "zone2", new.zone2_state)
-                                .await
-                            {
-                                warn!("Failed to write valve event for zone2: {}", e);
-                            }
                             push_zone_status(&mqtt_client, &pub_topic, "grass", new.zone2_state).await;
+                        }
+                        Some(prev) => {
+                            if prev.zone1_state != new.zone1_state {
+                                if let Err(e) = db_writer
+                                    .write_valve_event(&device_name, "zone1", new.zone1_state)
+                                    .await
+                                {
+                                    warn!("Failed to write valve event for zone1: {}", e);
+                                }
+                                push_zone_status(&mqtt_client, &pub_topic, "garden", new.zone1_state)
+                                    .await;
+                            }
+                            if prev.zone2_state != new.zone2_state {
+                                if let Err(e) = db_writer
+                                    .write_valve_event(&device_name, "zone2", new.zone2_state)
+                                    .await
+                                {
+                                    warn!("Failed to write valve event for zone2: {}", e);
+                                }
+                                push_zone_status(&mqtt_client, &pub_topic, "grass", new.zone2_state)
+                                    .await;
+                            }
                         }
                     }
                     prev = Some(new);
@@ -466,6 +501,32 @@ pub(crate) async fn run_valve_event_observer(
 pub(crate) struct ValveEventObserverGuard {
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
+}
+
+/// Where an inbound MQTT publish belongs. `Birth` means the HA status topic
+/// (the payload must still match `HA_BIRTH_PAYLOAD`); `Command` means the
+/// bridge's command topic; everything else is ignored and never parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MqttRoute {
+    Birth,
+    Command,
+    Ignore,
+}
+
+pub(crate) fn classify_topic(topic: &str, ha_topic: Option<&str>, sub_topic: &str) -> MqttRoute {
+    if ha_topic == Some(topic) {
+        MqttRoute::Birth
+    } else if topic == sub_topic {
+        MqttRoute::Command
+    } else {
+        MqttRoute::Ignore
+    }
+}
+
+/// Whether an HA status payload is the birth message. Kept separate from
+/// `classify_topic` so the payload-equality branch is directly testable.
+pub(crate) fn is_birth_payload(payload: &[u8], expected: &[u8]) -> bool {
+    payload == expected
 }
 
 /// Publish a `status` response for a zone on the c2s topic, reflecting a
@@ -513,6 +574,41 @@ impl ValveEventObserverGuard {
 }
 
 impl Drop for ValveEventObserverGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        self.task.abort();
+    }
+}
+
+/// BLE-free periodic republish of the cached status snapshot so consumers
+/// recover state without retained messages or polling.
+pub(crate) async fn run_state_heartbeat_loop(
+    app: Arc<App>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if wait_for_shutdown_or_timeout(&mut shutdown, interval).await {
+            break;
+        }
+        app.publish_state_snapshot().await;
+    }
+}
+
+pub(crate) struct StateHeartbeatGuard {
+    stop_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl StateHeartbeatGuard {
+    pub(crate) fn start(app: Arc<App>, interval: Duration) -> Self {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_state_heartbeat_loop(app, interval, stop_rx));
+        Self { stop_tx, task }
+    }
+}
+
+impl Drop for StateHeartbeatGuard {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(true);
         self.task.abort();
@@ -688,6 +784,28 @@ pub(crate) async fn run_connection_supervisor(
                 backoff = INITIAL_BACKOFF;
                 let _ = status_tx.send(None);
                 let _ = zone_names_tx.send(None);
+                // ff82 is change-driven, so there is no initial broadcast: read
+                // once to seed the cache before any consumer can query it. A
+                // read/parse failure must not tear down the connection.
+                match ble_client.read_status().await {
+                    Ok(data) => match Second82Protocol::from_bytes(&data) {
+                        Ok(parsed) => {
+                            info!(
+                                "initial status read (ff82): {} -> garden={} grass={}",
+                                hex::encode(&data),
+                                parsed.zone1_state,
+                                parsed.zone2_state
+                            );
+                            let _ = status_tx.send(Some(parsed));
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse initial status read (ff82): {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to read initial status (ff82): {}", e);
+                    }
+                }
                 let zone1 = match ble_client.read_zone1_name().await {
                     Ok(name) => {
                         info!("Decoded zone 1 name: {}", name);
@@ -715,12 +833,17 @@ pub(crate) async fn run_connection_supervisor(
                     break;
                 }
                 let _ = ready_tx.send(false);
+                // Cold the cache the moment the link drops so the heartbeat
+                // no-ops and consumers' own expiry yields a truthful offline
+                // state. The observer sees the None and resets its baseline.
+                let _ = status_tx.send(None);
                 let _ = zone_names_tx.send(None);
             }
             Err(e) => {
                 handle_connection_failure(&mut ladder, controller.as_ref(), &store, &e, backoff)
                     .await;
                 let _ = ready_tx.send(false);
+                let _ = status_tx.send(None);
                 if wait_for_shutdown_or_timeout(&mut shutdown, backoff).await {
                     break;
                 }
@@ -882,27 +1005,29 @@ async fn run_app_instance() -> Result<()> {
         config.device_name.clone(),
         config.mqtt_pub_topic.clone(),
     );
+    let _state_heartbeat = if config.state_heartbeat_secs > 0 {
+        Some(StateHeartbeatGuard::start(
+            app.clone(),
+            Duration::from_secs(config.state_heartbeat_secs),
+        ))
+    } else {
+        None
+    };
     let _connection = connection_guard;
 
     // Subscribe to MQTT topic
     info!("Subscribing to MQTT topic: {}", config.mqtt_sub_topic);
     mqtt_client.subscribe(&config.mqtt_sub_topic).await?;
     info!("Successfully subscribed.");
+    if let Some(ha_topic) = config.ha_status_topic.as_deref() {
+        info!("Subscribing to HA status topic: {}", ha_topic);
+        mqtt_client.subscribe(ha_topic).await?;
+    }
 
     // MQTT Event Loop
     loop {
         match eventloop.poll().await {
-            Ok(notification) => {
-                if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)) = notification {
-                    info!("Incoming MQTT publish on topic: {}", publish.topic);
-                    let app_clone = app.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = app_clone.handle_mqtt_message(&publish.payload).await {
-                            error!("Error handling MQTT message: {}", e);
-                        }
-                    });
-                }
-            }
+            Ok(notification) => handle_mqtt_event(&app, &config, notification),
             Err(e) => {
                 error!(
                     "MQTT loop error: {}. Returning to supervisor for restart...",
@@ -911,5 +1036,49 @@ async fn run_app_instance() -> Result<()> {
                 return Err(anyhow!("MQTT EventLoop error: {}", e));
             }
         }
+    }
+}
+
+/// Route one MQTT event: republish the cached snapshot on `ConnAck` and HA
+/// birth, handle commands from the command topic, and ignore everything else.
+fn handle_mqtt_event(app: &Arc<App>, config: &Config, notification: rumqttc::Event) {
+    match notification {
+        rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)) => {
+            let app_clone = app.clone();
+            tokio::spawn(async move {
+                app_clone.publish_state_snapshot().await;
+            });
+        }
+        rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)) => {
+            match classify_topic(
+                &publish.topic,
+                config.ha_status_topic.as_deref(),
+                &config.mqtt_sub_topic,
+            ) {
+                MqttRoute::Birth => {
+                    if is_birth_payload(&publish.payload, config.ha_birth_payload.as_bytes()) {
+                        info!(
+                            "HA birth payload received on {}; publishing state snapshot",
+                            publish.topic
+                        );
+                        let app_clone = app.clone();
+                        tokio::spawn(async move {
+                            app_clone.publish_state_snapshot().await;
+                        });
+                    }
+                }
+                MqttRoute::Command => {
+                    info!("Incoming MQTT publish on topic: {}", publish.topic);
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = app_clone.handle_mqtt_message(&publish.payload).await {
+                            error!("Error handling MQTT message: {}", e);
+                        }
+                    });
+                }
+                MqttRoute::Ignore => {}
+            }
+        }
+        _ => {}
     }
 }

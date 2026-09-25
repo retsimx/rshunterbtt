@@ -8,9 +8,10 @@ mod tests {
     };
     use crate::App;
     use crate::{
-        handle_connection_failure, next_backoff, run_battery_polling_loop,
-        run_connection_supervisor, run_valve_event_observer, BatteryPollingGuard,
-        BatteryPollingIntervals, StatusCacheSender, ZoneNamesCacheSender, INITIAL_BACKOFF,
+        classify_topic, handle_connection_failure, is_birth_payload, next_backoff,
+        run_battery_polling_loop, run_connection_supervisor, run_state_heartbeat_loop,
+        run_valve_event_observer, BatteryPollingGuard, BatteryPollingIntervals, MqttRoute,
+        StatusCacheSender, ZoneNamesCacheSender, INITIAL_BACKOFF,
     };
     use anyhow::anyhow;
     use mockall::predicate;
@@ -36,7 +37,41 @@ mod tests {
             device_password: None,
             default_run_seconds: 7200,
             conn_interval_ms: 4000,
+            ha_status_topic: Some("homeassistant/status".to_string()),
+            ha_birth_payload: "online".to_string(),
+            state_heartbeat_secs: 60,
         }
+    }
+
+    #[test]
+    fn test_classify_topic_routes() {
+        assert_eq!(
+            classify_topic("homeassistant/status", Some("homeassistant/status"), "sub"),
+            MqttRoute::Birth
+        );
+        assert_eq!(
+            classify_topic("sub", Some("homeassistant/status"), "sub"),
+            MqttRoute::Command
+        );
+        assert_eq!(
+            classify_topic("other", Some("homeassistant/status"), "sub"),
+            MqttRoute::Ignore
+        );
+        // Disabled HA topic: no birth route, only the command topic is honoured.
+        assert_eq!(
+            classify_topic("homeassistant/status", None, "sub"),
+            MqttRoute::Ignore
+        );
+        assert_eq!(classify_topic("sub", None, "sub"), MqttRoute::Command);
+    }
+
+    #[test]
+    fn test_is_birth_payload() {
+        assert!(is_birth_payload(b"online", b"online"));
+        assert!(!is_birth_payload(b"offline", b"online"));
+        assert!(!is_birth_payload(b"online ", b"online"));
+        assert!(!is_birth_payload(b"", b"online"));
+        assert!(!is_birth_payload(b"ONLINE", b"online"));
     }
 
     #[tokio::test]
@@ -1021,6 +1056,71 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_supervisor_clears_cache_on_disconnect() {
+        let mut ble = MockBleClient::new();
+
+        // First connect succeeds (cache warms from the seed read); the link then
+        // drops and every reconnect attempt fails, so the cache must stay cold.
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let cc = connect_count.clone();
+        ble.expect_connect().returning(move |_| {
+            let n = cc.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Ok(())
+                } else {
+                    Err(anyhow!("connect failed"))
+                }
+            })
+        });
+        ble.expect_write_password()
+            .returning(|_| Box::pin(async { Ok(()) }));
+        ble.expect_subscribe_notifications().returning(|_| {
+            let (_, rx) = tokio::sync::mpsc::channel(1);
+            Box::pin(async move { Ok(rx) })
+        });
+
+        let disconnect_pending = Arc::new(AtomicBool::new(false));
+        let dp = disconnect_pending.clone();
+        ble.expect_is_connected().returning(move || {
+            let d = dp.clone();
+            Box::pin(async move { !d.load(Ordering::SeqCst) })
+        });
+
+        ble.expect_read_status().returning(|| {
+            Box::pin(async {
+                let mut data = vec![0u8; 14];
+                data[10] = 5; // zone1 watering -> parsed Some
+                Ok(data)
+            })
+        });
+        ble.expect_read_zone1_name()
+            .returning(|| Box::pin(async { Ok("Zone 1".to_string()) }));
+        ble.expect_read_zone2_name()
+            .returning(|| Box::pin(async { Ok("Zone 2".to_string()) }));
+
+        let ble = Arc::new(ble);
+        let config = mock_config();
+        let (ready_tx, _ready_rx) = watch::channel(false);
+        let (status_tx, status_rx) = watch::channel(None);
+        let (zone_names_tx, _zone_names_rx) = watch::channel(None);
+
+        let stop_tx =
+            spawn_supervisor_with_zone_names(ble, config, ready_tx, status_tx, zone_names_tx);
+
+        // Seed read warms the cache.
+        wait_until(|| status_rx.borrow().is_some()).await;
+
+        // BLE drops: the supervisor must cold the cache so the heartbeat no-ops
+        // and consumers' expiry yields a truthful offline state.
+        disconnect_pending.store(true, Ordering::SeqCst);
+        wait_until(|| status_rx.borrow().is_none()).await;
+
+        let _ = stop_tx.send(true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     fn valve_event_protocol(zone1: bool, zone2: bool) -> Second82Protocol {
         let mut data = vec![0u8; 14];
         data[10] = if zone1 { 5 } else { 1 }; // 5 = watering, 1 = idle
@@ -1137,7 +1237,11 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let mut mqtt = MockMqttClient::new();
-        mqtt.expect_publish().times(0);
+        // Baseline publishes both zones once; the identical follow-up state is a
+        // no-op and must not publish again.
+        mqtt.expect_publish()
+            .times(2)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
         let handle = tokio::spawn(run_valve_event_observer(
             status_rx,
             Arc::new(db),
@@ -1212,7 +1316,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let mut mqtt = MockMqttClient::new();
-        mqtt.expect_publish().times(0);
+        // Two baselines (before and after the reset), each publishing both zones.
+        mqtt.expect_publish()
+            .times(4)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
         let handle = tokio::spawn(run_valve_event_observer(
             status_rx,
             Arc::new(db),
@@ -1234,6 +1341,212 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valve_event_observer_baseline_publishes_both_zones_without_db_event() {
+        let mut db = MockDatabaseWriter::new();
+        db.expect_write_valve_event().times(0);
+
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""zone":"garden""#)
+                    .and(predicate::str::contains(r#""status":1"#)),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""zone":"grass""#)
+                    .and(predicate::str::contains(r#""status":0"#)),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_valve_event_observer(
+            status_rx,
+            Arc::new(db),
+            Arc::new(mqtt),
+            "test_device".to_string(),
+            "pub".to_string(),
+            shutdown_rx,
+        ));
+
+        status_tx
+            .send(Some(valve_event_protocol(true, false)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_valve_event_observer_change_publishes_one_and_writes_event() {
+        let mut db = MockDatabaseWriter::new();
+        db.expect_write_valve_event()
+            .with(eq("test_device"), eq("zone1"), eq(true))
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        let mut mqtt = MockMqttClient::new();
+        // Baseline: garden and grass both off.
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""zone":"garden""#)
+                    .and(predicate::str::contains(r#""status":0"#)),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""zone":"grass""#)
+                    .and(predicate::str::contains(r#""status":0"#)),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+        // Change: only garden turns on.
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""zone":"garden""#)
+                    .and(predicate::str::contains(r#""status":1"#)),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_valve_event_observer(
+            status_rx,
+            Arc::new(db),
+            Arc::new(mqtt),
+            "test_device".to_string(),
+            "pub".to_string(),
+            shutdown_rx,
+        ));
+
+        status_tx
+            .send(Some(valve_event_protocol(false, false)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        status_tx
+            .send(Some(valve_event_protocol(true, false)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_publish_state_snapshot_emits_two_normalized_messages_when_warm() {
+        let ble = MockBleClient::new();
+        let db = MockDatabaseWriter::new();
+
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""zone":"garden""#)
+                    .and(predicate::str::contains(r#""status":1"#)),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+        mqtt.expect_publish()
+            .with(
+                eq("pub"),
+                predicate::str::contains(r#""zone":"grass""#)
+                    .and(predicate::str::contains(r#""status":0"#)),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db))
+            .with_status_cache(status_rx, status_tx.clone());
+        status_tx
+            .send(Some(valve_event_protocol(true, false)))
+            .unwrap();
+
+        app.publish_state_snapshot().await;
+    }
+
+    #[tokio::test]
+    async fn test_publish_state_snapshot_noop_when_cold() {
+        let ble = MockBleClient::new();
+        let db = MockDatabaseWriter::new();
+
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish().times(0);
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let app = App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db))
+            .with_status_cache(status_rx, status_tx);
+
+        app.publish_state_snapshot().await;
+    }
+
+    #[tokio::test]
+    async fn test_state_heartbeat_noop_when_cache_cold() {
+        let ble = MockBleClient::new();
+        let db = MockDatabaseWriter::new();
+
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish().times(0);
+
+        let (status_tx, status_rx) = watch::channel(None);
+        let app = Arc::new(
+            App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db))
+                .with_status_cache(status_rx, status_tx),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_state_heartbeat_loop(
+            app,
+            Duration::from_millis(20),
+            shutdown_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_state_heartbeat_publishes_while_cache_warm() {
+        let ble = MockBleClient::new();
+        let db = MockDatabaseWriter::new();
+
+        let mut mqtt = MockMqttClient::new();
+        mqtt.expect_publish()
+            .times(1..)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let (status_tx, status_rx) = watch::channel(None);
+        status_tx
+            .send(Some(valve_event_protocol(true, false)))
+            .unwrap();
+        let app = Arc::new(
+            App::new(mock_config(), Arc::new(ble), Arc::new(mqtt), Arc::new(db))
+                .with_status_cache(status_rx, status_tx),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_state_heartbeat_loop(
+            app,
+            Duration::from_millis(20),
+            shutdown_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(70)).await;
         shutdown_tx.send(true).unwrap();
         handle.await.unwrap();
     }

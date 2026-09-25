@@ -21,6 +21,9 @@ fn mock_config() -> Config {
         device_password: None,
         default_run_seconds: 7200,
         conn_interval_ms: 4000,
+        ha_status_topic: Some("homeassistant/status".to_string()),
+        ha_birth_payload: "online".to_string(),
+        state_heartbeat_secs: 60,
     }
 }
 
