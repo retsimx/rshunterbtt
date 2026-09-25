@@ -76,6 +76,17 @@ MQTT_PUB_TOPIC=irrigation/c2s/rear
 # guard (HCI monitor) detects and re-applies this value.
 # CONN_INTERVAL_MS=1000
 
+# Home Assistant state sync (defaults shown). The bridge seeds zone state with
+# one ff82 read on each (re)connect, publishes a baseline for both zones,
+# republishes a cached snapshot whenever HA announces its birth on
+# HA_STATUS_TOPIC, and refreshes it every STATE_HEARTBEAT_SECS (MQTT only, no
+# BLE). This lets consumers (e.g. HA) recover state without retained messages
+# or polling. Set HA_STATUS_TOPIC empty to disable the birth trigger; set
+# STATE_HEARTBEAT_SECS=0 to disable the periodic refresh.
+# HA_STATUS_TOPIC=homeassistant/status
+# HA_BIRTH_PAYLOAD=online
+# STATE_HEARTBEAT_SECS=60
+
 # InfluxDB Configuration
 INFLUXDB_URL=http://10.0.25.10:8086
 INFLUXDB_TOKEN=your_token_here
@@ -105,6 +116,26 @@ when an `on_off` start command does not specify a `duration_seconds`.
 The default is `7200` (2 hours). It acts as a failsafe so a start
 command without an explicit duration still stops the zone after a
 bounded time.
+
+### Home Assistant state sync (`HA_STATUS_TOPIC`, `HA_BIRTH_PAYLOAD`, `STATE_HEARTBEAT_SECS`)
+
+`ff82` notifications are change-driven, so the bridge has no state until the
+device reports a change. To let consumers (Home Assistant, and downstream
+Google Home via the smart-home bridge) restore correct state after a restart
+without MQTT retained messages or polling:
+
+- on every BLE (re)connect the bridge performs **one** `ff82` read to seed its
+  cached state, then publishes a baseline `status` for both zones;
+- it republishes the cached snapshot on every MQTT (re)connect and whenever
+  `HA_STATUS_TOPIC` (default `homeassistant/status`) receives
+  `HA_BIRTH_PAYLOAD` (default `online`) — Home Assistant sends this on startup;
+- it refreshes the cached snapshot for both zones every
+  `STATE_HEARTBEAT_SECS` (default `60`), which is MQTT-only and performs no BLE
+  I/O.
+
+Disable the birth trigger by setting `HA_STATUS_TOPIC` to an empty string, and
+the periodic refresh by setting `STATE_HEARTBEAT_SECS=0`. All three default to
+production-safe values; no configuration is required.
 
 ## MQTT Interface
 
