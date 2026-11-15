@@ -7,7 +7,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use std::time::Duration;
 use tokio::time;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::protocol::{
@@ -84,14 +84,14 @@ impl BleClient for BtleplugClient {
 
         time::sleep(Duration::from_secs(10)).await;
 
-        let peripherals = self.central.peripherals().await?;
+        let peripherals_res = self.central.peripherals().await;
+        if let Err(e) = self.central.stop_scan().await {
+            warn!("Failed to stop BLE scan: {}", e);
+        }
+        let peripherals = peripherals_res?;
         for p in peripherals {
             if p.address().to_string() == address {
                 info!("Found device {}, connecting...", address);
-
-                // Try to stop scanning before connecting if we were the ones who started it
-                let _ = self.central.stop_scan().await;
-
                 p.connect().await?;
                 info!("Connected to {}. Discovering services...", address);
                 p.discover_services().await?;
