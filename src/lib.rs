@@ -556,9 +556,9 @@ async fn run_connection_setup(
 
     // The peripheral sends an L2CAP Connection Parameter Update Request shortly
     // after connecting (requesting a fast ~48-56ms interval), which BlueZ
-    // honours and which reverts our requested interval. The process-lifetime
-    // hci_monitor observes controller events for diagnostics only; it does not
-    // trigger connection recovery or host/adapter actions.
+    // honours and which reverts our requested interval. Request it once here,
+    // then let the process-lifetime hci_monitor re-assert it (rate-limited)
+    // whenever our own link reports an off-target interval.
     if let Err(e) = crate::hci::request_interval(&config.device_address, config.conn_interval_ms) {
         warn!(
             "Failed to request {}ms connection interval: {}",
@@ -940,15 +940,16 @@ impl Drop for ConnectionGuard {
 pub async fn run_app() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    // The HCI monitor observes controller events for the life of the process,
-    // but remains diagnostic-only. It is spawned once from the initial config;
-    // the socket is bound synchronously so monitoring is active before setup.
+    // The HCI monitor watches controller events for the life of the process:
+    // it re-asserts the configured connection interval when our own link
+    // reports an off-target value, and logs controller diagnostics. It never
+    // triggers connection, adapter, or host recovery.
     let config = Config::from_env()?;
     if !crate::hci_monitor::spawn_hci_monitor(
         config.device_address.clone(),
         config.conn_interval_ms,
     ) {
-        warn!("HCI diagnostic monitor unavailable; controller status will not be logged");
+        warn!("HCI interval guard unavailable; controller status will not be logged");
     }
 
     let shared_adapter = SharedAdapter::default();

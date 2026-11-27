@@ -20,8 +20,8 @@ future work rather than defects.
 - **Valve state events** — every observed zone transition is written to
   InfluxDB as an `irrigation` measurement.
 - **Connection interval control** — a configurable interval requested over raw
-  HCI, with process-lifetime HCI diagnostics for controller and negotiated-link
-  events. See [connection interval](connection-interval.md).
+  HCI, with an event-driven guard that re-applies it whenever our own link
+  re-negotiates away from target. See [connection interval](connection-interval.md).
 - **Normal failure recovery** — reconnect with backoff and, after five
   consecutive failed acquisitions, reinitialize the shared btleplug Adapter.
   Destructive host or adapter recovery is intentionally absent.

@@ -59,7 +59,7 @@ A dropped connection is re-established with exponential backoff, and the
 service re-runs full connection setup including re-subscription (`ff82` does
 not survive a drop).
 
-### Shared Adapter and controller diagnostics
+### Shared adapter and interval guard
 
 `run_app` creates one `SharedAdapter` and reuses it across MQTT-triggered
 `run_app_instance` restarts. The shared slot retains the btleplug Adapter and
@@ -69,9 +69,10 @@ successful setup resets the failure count.
 
 Normal Device-not-found, start-scan, and connection failures use backoff and
 retry/reinitialize only. There is no host reboot, adapter power-cycle, or
-persistent escalation state. `hci_monitor` runs once for process lifetime and
-logs disconnection/controller status for diagnostics; it never gates or
-restarts recovery based on HCI status.
+persistent escalation state. `hci_monitor` runs once for process lifetime; it
+logs disconnection/controller status for diagnostics and re-applies the
+configured connection interval whenever our own link reports an off-target
+value. It never gates or restarts recovery based on HCI status.
 
 ## Battery expectation
 

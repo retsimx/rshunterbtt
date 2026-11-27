@@ -17,8 +17,9 @@ A resilient Rust-based MQTT/BLE bridge for Hunter BTT irrigation controllers, mi
 - **Resilient supervisor**: reconnects with exponential backoff after any drop;
   a `SharedAdapter` is reused across MQTT instance restarts and rebuilt after five
   consecutive acquisition failures, without host or adapter escalation.
-- **HCI diagnostics**: requests the configured BLE connection interval and watches
-  the controller's HCI event stream for process-lifetime status logging only.
+- **Interval guard**: requests a configurable BLE connection interval and watches
+  the controller's HCI event stream, re-applying the interval whenever the
+  peripheral re-negotiates it back to fast.
 - **MQTT control + telemetry**: zone commands and status over MQTT; battery
   telemetry written directly to InfluxDB, bypassing MQTT.
 - **Dependency injection**: Rust traits with `mockall` for comprehensive unit and
@@ -43,7 +44,7 @@ Reference notes on the protocol and design live in [`docs/`](docs/README.md):
 - [GATT profile](docs/protocol/gatt-profile.md) — services, characteristics, notifications
 - [AIS protocol](docs/protocol/ais-protocol.md) — framing, command IDs, the zone-state enum
 - [Architecture](docs/architecture.md) — the persistent-connection design
-- [Connection interval](docs/connection-interval.md) — latency vs battery, and HCI diagnostics
+- [Connection interval](docs/connection-interval.md) — latency vs battery, and the interval guard
 - [Battery life](docs/battery-life.md) — real-world figures from InfluxDB
 - [HA integration](docs/ha-integration.md) — protocol features for a home-automation consumer
 - [Integration strategy](docs/integration-strategy.md) — the decision record
@@ -71,8 +72,8 @@ MQTT_PUB_TOPIC=irrigation/c2s/rear
 # BLE connection interval (ms; 8-4000, default 4000). Lower = faster MQTT
 # command turnaround but more radio connection events (battery drain).
 # Empirical: 60ms -> ~0.5s commands, 1000ms -> ~5s, 4000ms -> ~21s. The
-# Hunter BTT peripheral re-negotiates back to ~48-60ms; the HCI monitor logs
-# negotiated/controller status for diagnostics without reapplying or gating recovery.
+# Hunter BTT peripheral re-negotiates back to ~48-60ms; the bridge's interval
+# guard (HCI monitor) detects and re-applies this value.
 # CONN_INTERVAL_MS=1000
 
 # InfluxDB Configuration
@@ -174,14 +175,18 @@ ladder state.
 
 ### HCI monitoring
 
-`src/hci_monitor.rs` is spawned once for process lifetime. It logs HCI
-disconnection and controller status events, including `0x2005`, for diagnostics.
-It does not use HCI status to gate or restart connection recovery.
+`src/hci_monitor.rs` is spawned once for process lifetime. It re-applies the
+configured connection interval whenever our own link reports an off-target
+`LE Connection Update Complete` (rate-limited to one attempt per 3 s), and logs
+HCI disconnection and controller status events, including `0x2005`. It never
+uses HCI status to gate or restart connection recovery.
 
 ### Required host permissions
 
 - **`CAP_NET_ADMIN`** (i.e. run as root) for the raw HCI sockets used to request
-  the configured connection interval and to monitor controller events.
+  the connection interval and to run the interval guard — the monitor decodes
+  `LE Connection Update Complete` events and re-applies the configured interval
+  when the peripheral re-negotiates it away.
 
 ## Development
 
@@ -209,9 +214,10 @@ The request is scoped to the bridge's own connection (the HCI handle is
 resolved from `DEVICE_ADDRESS`), so sharing an adapter with other BLE devices
 is safe.
 
-The process-lifetime HCI monitor logs negotiated interval and controller status
-events for diagnostics only. It does not reapply interval changes or use HCI
-status to gate or restart BLE recovery.
+The Hunter BTT peripheral re-negotiates the interval back towards ~50ms shortly
+after connecting (and intermittently afterwards), which BlueZ honours. The
+interval guard watches the controller's event stream and re-applies the
+configured value whenever the peripheral pulls the interval away from target.
 
 1. Copy the cross-compiled binary to `/root/rshunterbtt/rshunterbtt`.
 2. Create `/root/rshunterbtt/.env` with the correct device settings.
