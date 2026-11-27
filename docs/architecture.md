@@ -59,13 +59,19 @@ A dropped connection is re-established with exponential backoff, and the
 service re-runs full connection setup including re-subscription (`ff82` does
 not survive a drop).
 
-### Host controller resilience
+### Shared Adapter and controller diagnostics
 
-The Pi's BCM43430A1 controller gets into a bad state (HCI EBUSY,
-`le-connection-abort-by-local`) in which connects fail; a full reboot clears it.
-The bridge escalates through a recovery ladder — reconnect with backoff, then
-an adapter power-cycle over D-Bus, then a host reboot via `reboot(2)` — with
-each rung independently rate-limited. Thresholds are documented in the README.
+`run_app` creates one `SharedAdapter` and reuses it across MQTT-triggered
+`run_app_instance` restarts. The shared slot retains the btleplug Adapter and
+scan-active state. After five consecutive failed acquisitions, the supervisor
+clears and rebuilds the Adapter via `setup_central` / `Manager::new()`; a
+successful setup resets the failure count.
+
+Normal Device-not-found, start-scan, and connection failures use backoff and
+retry/reinitialize only. There is no host reboot, adapter power-cycle, or
+persistent escalation state. `hci_monitor` runs once for process lifetime and
+logs disconnection/controller status for diagnostics; it never gates or
+restarts recovery based on HCI status.
 
 ## Battery expectation
 
@@ -82,8 +88,6 @@ each rung independently rate-limited. Thresholds are documented in the README.
   lower power.
 - **Password (`ff81`)** — whether the device enforces it; the bridge sends the
   configured value (or the documented default) regardless.
-- **Interval guard handle filtering** — the guard does not filter by connection
-  handle. See [connection interval](connection-interval.md).
 
 ## HA integration
 

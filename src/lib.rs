@@ -1,24 +1,20 @@
 pub mod ble;
 pub mod config;
 pub mod database;
-pub mod dbus_control;
 pub mod hci;
 pub mod hci_monitor;
 pub mod mqtt;
 pub mod protocol;
-pub mod reboot;
-pub mod resilience;
 pub mod traits;
 
 #[cfg(test)]
 mod app_tests;
 
+use crate::ble::{SharedAdapter, BLE_CLEANUP_TIMEOUT};
 use crate::config::Config;
 use crate::protocol::{Second82Protocol, Second86Protocol};
-use crate::resilience::{LadderAction, ResilienceLadder, ResilienceState, ResilienceStateStore};
-use crate::traits::{BleClient, DatabaseWriter, MqttClient, ResilienceController};
+use crate::traits::{BleClient, DatabaseWriter, MqttClient};
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -560,9 +556,9 @@ async fn run_connection_setup(
 
     // The peripheral sends an L2CAP Connection Parameter Update Request shortly
     // after connecting (requesting a fast ~48-56ms interval), which BlueZ
-    // honours and which reverts our requested interval. The interval guard
-    // (hci_monitor) watches the controller's event stream for that and
-    // re-applies the configured value, so no reconnect dance is needed here.
+    // honours and which reverts our requested interval. The process-lifetime
+    // hci_monitor observes controller events for diagnostics only; it does not
+    // trigger connection recovery or host/adapter actions.
     if let Err(e) = crate::hci::request_interval(&config.device_address, config.conn_interval_ms) {
         warn!(
             "Failed to request {}ms connection interval: {}",
@@ -607,54 +603,141 @@ async fn wait_for_disconnect_or_shutdown(
     }
 }
 
-async fn handle_connection_failure(
-    ladder: &mut ResilienceLadder,
-    controller: &dyn ResilienceController,
-    store: &ResilienceStateStore,
-    err: &anyhow::Error,
-    backoff: Duration,
+#[derive(Default)]
+struct CleanupGateState {
+    started: bool,
+    completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupOwner {
+    Owner,
+    Waiter,
+    Completed,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CleanupGate {
+    state: Arc<tokio::sync::Mutex<CleanupGateState>>,
+    completed: Arc<tokio::sync::Notify>,
+}
+
+impl CleanupGate {
+    async fn reset(&self) {
+        let mut state = self.state.lock().await;
+        state.started = false;
+        state.completed = false;
+    }
+
+    async fn begin(&self) -> CleanupOwner {
+        let mut state = self.state.lock().await;
+        if state.started {
+            if state.completed {
+                CleanupOwner::Completed
+            } else {
+                CleanupOwner::Waiter
+            }
+        } else {
+            state.started = true;
+            state.completed = false;
+            CleanupOwner::Owner
+        }
+    }
+
+    async fn wait(&self) {
+        let notified = self.completed.notified();
+        let state = self.state.lock().await;
+        if state.completed {
+            return;
+        }
+        drop(state);
+        if tokio::time::timeout(BLE_CLEANUP_TIMEOUT.saturating_mul(2), notified)
+            .await
+            .is_err()
+        {
+            warn!(
+                "Timed out waiting for in-progress BLE peripheral cleanup after {}s",
+                BLE_CLEANUP_TIMEOUT.saturating_mul(2).as_secs()
+            );
+        }
+    }
+
+    async fn finish(&self) {
+        let mut state = self.state.lock().await;
+        state.completed = true;
+        drop(state);
+        self.completed.notify_waiters();
+    }
+
+    async fn run_once(&self, ble_client: &Arc<dyn BleClient>) {
+        match self.begin().await {
+            CleanupOwner::Owner => {
+                match tokio::time::timeout(BLE_CLEANUP_TIMEOUT, ble_client.disconnect()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("BLE peripheral cleanup returned error: {}", e),
+                    Err(_) => warn!(
+                        "Timed out BLE peripheral cleanup after {}s",
+                        BLE_CLEANUP_TIMEOUT.as_secs()
+                    ),
+                }
+                self.finish().await;
+            }
+            CleanupOwner::Waiter => self.wait().await,
+            CleanupOwner::Completed => {}
+        }
+    }
+}
+
+async fn bounded_ble_disconnect_once(ble_client: &Arc<dyn BleClient>, cleanup_gate: &CleanupGate) {
+    cleanup_gate.run_once(ble_client).await;
+}
+
+async fn bounded_fifth_reinit_cleanup(
+    ble_client: &Arc<dyn BleClient>,
+    shared_adapter: &SharedAdapter,
+    cleanup_gate: &CleanupGate,
 ) {
-    let now = Utc::now();
-    let action = ladder.on_connection_failure(now);
-    let count = ladder.consecutive_failures();
-    match action {
-        LadderAction::PowerCycle => {
-            error!(
-                "Connection setup failed ({} consecutive failures): power-cycling adapter",
-                count
-            );
-            if let Err(pe) = controller.power_cycle_adapter().await {
-                error!("Power-cycle adapter failed: {}", pe);
+    let is_owner = match cleanup_gate.begin().await {
+        CleanupOwner::Owner => {
+            match tokio::time::timeout(BLE_CLEANUP_TIMEOUT, ble_client.disconnect()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("BLE peripheral cleanup returned error: {}", e),
+                Err(_) => warn!(
+                    "Timed out BLE peripheral cleanup after {}s",
+                    BLE_CLEANUP_TIMEOUT.as_secs()
+                ),
             }
-            if let Err(se) = store.save(ladder.state()) {
-                error!("Failed to persist resilience state: {}", se);
-            }
+            true
         }
-        LadderAction::Reboot => {
-            error!(
-                "Connection setup failed ({} consecutive failures, rung 3): rebooting host",
-                count
-            );
-            if let Err(se) = store.save(ladder.state()) {
-                error!("Failed to persist resilience state before reboot: {}", se);
-            }
-            if let Err(re) = controller.reboot_host().await {
-                error!("Reboot failed: {}", re);
-            }
+        CleanupOwner::Waiter => {
+            cleanup_gate.wait().await;
+            false
         }
-        LadderAction::KeepRetrying => {
-            error!(
-                "Connection setup failed ({} consecutive failures): 24h reboot cap reached; keep retrying",
-                count
-            );
+        CleanupOwner::Completed => false,
+    };
+
+    shared_adapter
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    match tokio::time::timeout(
+        BLE_CLEANUP_TIMEOUT,
+        crate::ble::setup_central(shared_adapter),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            info!("Shared BLE adapter reinitialized after five failed acquisitions")
         }
-        LadderAction::None => {
-            error!(
-                "Connection setup failed: {}. Retrying in {}s...",
-                err,
-                backoff.as_secs()
-            );
-        }
+        Ok(Err(reinit_error)) => warn!(
+            "Failed to reinitialize shared BLE adapter after five failures: {}",
+            reinit_error
+        ),
+        Err(_) => warn!("Timed out reinitializing shared BLE adapter after five failures"),
+    }
+
+    if is_owner {
+        cleanup_gate.finish().await;
     }
 }
 
@@ -666,25 +749,24 @@ pub(crate) async fn run_connection_supervisor(
     ready_tx: watch::Sender<bool>,
     status_tx: StatusCacheSender,
     zone_names_tx: ZoneNamesCacheSender,
-    controller: Arc<dyn ResilienceController>,
-    store: ResilienceStateStore,
+    shared_adapter: SharedAdapter,
+    cleanup_gate: CleanupGate,
 ) {
-    let state = match store.load() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to load resilience state ({}); starting fresh", e);
-            ResilienceState::default()
-        }
-    };
-    let mut ladder = ResilienceLadder::from_state(state);
     let mut backoff = INITIAL_BACKOFF;
     loop {
         if *shutdown.borrow() {
             break;
         }
+        cleanup_gate.reset().await;
         match run_connection_setup(&ble_client, &config).await {
             Ok(notif_rx) => {
-                ladder.on_connection_success();
+                if !*shutdown.borrow() {
+                    cleanup_gate.reset().await;
+                }
+                shared_adapter
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_acquisition_success();
                 backoff = INITIAL_BACKOFF;
                 let _ = status_tx.send(None);
                 let _ = zone_names_tx.send(None);
@@ -718,8 +800,19 @@ pub(crate) async fn run_connection_supervisor(
                 let _ = zone_names_tx.send(None);
             }
             Err(e) => {
-                handle_connection_failure(&mut ladder, controller.as_ref(), &store, &e, backoff)
-                    .await;
+                let should_reinit = shared_adapter
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_acquisition_failure();
+                if should_reinit {
+                    bounded_fifth_reinit_cleanup(&ble_client, &shared_adapter, &cleanup_gate).await;
+                }
+
+                error!(
+                    "Connection setup failed: {}. Retrying in {}s...",
+                    e,
+                    backoff.as_secs()
+                );
                 let _ = ready_tx.send(false);
                 if wait_for_shutdown_or_timeout(&mut shutdown, backoff).await {
                     break;
@@ -728,6 +821,8 @@ pub(crate) async fn run_connection_supervisor(
             }
         }
     }
+
+    bounded_ble_disconnect_once(&ble_client, &cleanup_gate).await;
 }
 
 fn spawn_notification_consumer(
@@ -765,14 +860,16 @@ fn spawn_notification_consumer(
 
 pub(crate) struct ConnectionGuard {
     stop_tx: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    ble_client: Arc<dyn BleClient>,
+    cleanup_gate: CleanupGate,
+    task: Option<JoinHandle<()>>,
 }
 
 impl ConnectionGuard {
     pub(crate) fn start(
         ble_client: Arc<dyn BleClient>,
         config: Config,
-        controller: Arc<dyn ResilienceController>,
+        shared_adapter: SharedAdapter,
     ) -> (
         Self,
         watch::Receiver<bool>,
@@ -784,62 +881,91 @@ impl ConnectionGuard {
         let (ready_tx, ready_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(None);
         let (zone_names_tx, zone_names_rx) = watch::channel(None);
-        let store = ResilienceStateStore::new(&config.device_name);
+        let cleanup_gate = CleanupGate::default();
+        let supervisor_cleanup = cleanup_gate.clone();
+        let supervisor_ble = ble_client.clone();
         let task = tokio::spawn(run_connection_supervisor(
-            ble_client,
+            supervisor_ble,
             config,
             stop_rx,
             ready_tx,
             status_tx.clone(),
             zone_names_tx,
-            controller,
-            store,
+            shared_adapter,
+            supervisor_cleanup,
         ));
         (
-            Self { stop_tx, task },
+            Self {
+                stop_tx,
+                ble_client,
+                cleanup_gate,
+                task: Some(task),
+            },
             ready_rx,
             status_rx,
             status_tx,
             zone_names_rx,
         )
     }
+
+    pub(crate) async fn shutdown(&mut self) {
+        let _ = self.stop_tx.send(true);
+        bounded_ble_disconnect_once(&self.ble_client, &self.cleanup_gate).await;
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(true);
-        self.task.abort();
+        let ble_client = self.ble_client.clone();
+        let cleanup_gate = self.cleanup_gate.clone();
+
+        if let Some(task) = self.task.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        bounded_ble_disconnect_once(&ble_client, &cleanup_gate).await;
+                        task.abort();
+                    });
+                }
+                Err(_) => task.abort(),
+            }
+        }
     }
 }
 
 pub async fn run_app() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    // The interval guard watches HCI events for the life of the process, so it
-    // is spawned here (once) from the initial config. The socket is bound
-    // synchronously, guaranteeing it is active before any connection setup
-    // issues an interval update.
+    // The HCI monitor observes controller events for the life of the process,
+    // but remains diagnostic-only. It is spawned once from the initial config;
+    // the socket is bound synchronously so monitoring is active before setup.
     let config = Config::from_env()?;
     if !crate::hci_monitor::spawn_hci_monitor(
         config.device_address.clone(),
         config.conn_interval_ms,
     ) {
-        warn!("interval guard unavailable; the connection interval may revert unnoticed");
+        warn!("HCI diagnostic monitor unavailable; controller status will not be logged");
     }
+
+    let shared_adapter = SharedAdapter::default();
 
     loop {
         info!("Starting rshunterbtt...");
-        if let Err(e) = run_app_instance().await {
+        if let Err(e) = run_app_instance(shared_adapter.clone()).await {
             error!("Application instance crashed: {}. Restarting in 10s...", e);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     }
 }
 
-async fn run_app_instance() -> Result<()> {
+async fn run_app_instance(shared_adapter: SharedAdapter) -> Result<()> {
     let config = Config::from_env()?;
 
-    let ble_client = Arc::new(crate::ble::BtleplugClient::new().await?);
+    let ble_client = Arc::new(crate::ble::BtleplugClient::new(shared_adapter.clone()).await?);
 
     let (mqtt_client_impl, mut eventloop) = crate::mqtt::RumqttcClient::new(
         &config.mqtt_broker,
@@ -863,9 +989,8 @@ async fn run_app_instance() -> Result<()> {
         db_writer,
     );
 
-    let controller = Arc::new(crate::dbus_control::SystemResilienceController::default());
-    let (connection_guard, connection_ready, status_cache, status_tx, zone_names) =
-        ConnectionGuard::start(ble_client, config.clone(), controller);
+    let (mut connection_guard, connection_ready, status_cache, status_tx, zone_names) =
+        ConnectionGuard::start(ble_client, config.clone(), shared_adapter);
     let status_cache_observer = status_cache.clone();
     let app = Arc::new(
         app.with_connection_ready(connection_ready)
@@ -882,11 +1007,12 @@ async fn run_app_instance() -> Result<()> {
         config.device_name.clone(),
         config.mqtt_pub_topic.clone(),
     );
-    let _connection = connection_guard;
-
     // Subscribe to MQTT topic
     info!("Subscribing to MQTT topic: {}", config.mqtt_sub_topic);
-    mqtt_client.subscribe(&config.mqtt_sub_topic).await?;
+    if let Err(e) = mqtt_client.subscribe(&config.mqtt_sub_topic).await {
+        connection_guard.shutdown().await;
+        return Err(e);
+    }
     info!("Successfully subscribed.");
 
     // MQTT Event Loop
@@ -908,6 +1034,7 @@ async fn run_app_instance() -> Result<()> {
                     "MQTT loop error: {}. Returning to supervisor for restart...",
                     e
                 );
+                connection_guard.shutdown().await;
                 return Err(anyhow!("MQTT EventLoop error: {}", e));
             }
         }

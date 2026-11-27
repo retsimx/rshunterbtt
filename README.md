@@ -14,12 +14,11 @@ A resilient Rust-based MQTT/BLE bridge for Hunter BTT irrigation controllers, mi
 - **Notification-driven status**: subscribes to the `ff82` status characteristic
   and caches pushed state changes, so a self-timed stop or a physical button
   press is observed immediately rather than polled for.
-- **Resilient supervisor**: reconnects with exponential backoff after any drop,
-  and escalates through a recovery ladder (BLE adapter power-cycle, then host
-  reboot) when connection-setup failures persist.
-- **Interval guard**: requests a configurable BLE connection interval and watches
-  the controller's HCI event stream, re-applying the interval whenever the
-  peripheral re-negotiates it back to fast.
+- **Resilient supervisor**: reconnects with exponential backoff after any drop;
+  a `SharedAdapter` is reused across MQTT instance restarts and rebuilt after five
+  consecutive acquisition failures, without host or adapter escalation.
+- **HCI diagnostics**: requests the configured BLE connection interval and watches
+  the controller's HCI event stream for process-lifetime status logging only.
 - **MQTT control + telemetry**: zone commands and status over MQTT; battery
   telemetry written directly to InfluxDB, bypassing MQTT.
 - **Dependency injection**: Rust traits with `mockall` for comprehensive unit and
@@ -32,9 +31,9 @@ A resilient Rust-based MQTT/BLE bridge for Hunter BTT irrigation controllers, mi
 
 The project supports multiple controllers across different Raspberry Pi devices:
 
-- **Rear Controller**: `18:04:ED:53:6D:20` (Deployed on `rearpiw`)
-- **Front Controller**: `18:04:ED:56:9F:71` (Deployed on `bedroompiw`)
-- **Front Small Controller**: `F4:60:77:2F:3F:78` (Deployed on `frontpiw`)
+- **Rear Controller**: `<rear-controller-mac>` (Deployed on `<rear-host>`)
+- **Front Controller**: `<front-controller-mac>` (Deployed on `<front-host>`)
+- **Front Small Controller**: `<small-front-controller-mac>` (Deployed on `<small-front-host>`)
 
 ## Documentation
 
@@ -44,7 +43,7 @@ Reference notes on the protocol and design live in [`docs/`](docs/README.md):
 - [GATT profile](docs/protocol/gatt-profile.md) — services, characteristics, notifications
 - [AIS protocol](docs/protocol/ais-protocol.md) — framing, command IDs, the zone-state enum
 - [Architecture](docs/architecture.md) — the persistent-connection design
-- [Connection interval](docs/connection-interval.md) — latency vs battery, and the interval guard
+- [Connection interval](docs/connection-interval.md) — latency vs battery, and HCI diagnostics
 - [Battery life](docs/battery-life.md) — real-world figures from InfluxDB
 - [HA integration](docs/ha-integration.md) — protocol features for a home-automation consumer
 - [Integration strategy](docs/integration-strategy.md) — the decision record
@@ -56,12 +55,12 @@ Configuration is managed via a `.env` file in the working directory:
 
 ```env
 # BLE Configuration
-DEVICE_ADDRESS=18:04:ED:53:6D:20
+DEVICE_ADDRESS=<device-mac>
 DEVICE_NAME=rear
 # DEVICE_PASSWORD=<plain ASCII string, up to 4 characters>
 
 # MQTT Configuration
-MQTT_BROKER=10.0.21.245
+MQTT_BROKER=<broker-address>
 MQTT_PORT=1883
 MQTT_SUB_TOPIC=irrigation/s2c/rear/#
 MQTT_PUB_TOPIC=irrigation/c2s/rear
@@ -72,12 +71,12 @@ MQTT_PUB_TOPIC=irrigation/c2s/rear
 # BLE connection interval (ms; 8-4000, default 4000). Lower = faster MQTT
 # command turnaround but more radio connection events (battery drain).
 # Empirical: 60ms -> ~0.5s commands, 1000ms -> ~5s, 4000ms -> ~21s. The
-# Hunter BTT peripheral re-negotiates back to ~48-60ms; the bridge's interval
-# guard (HCI monitor) detects and re-applies this value.
+# Hunter BTT peripheral re-negotiates back to ~48-60ms; the HCI monitor logs
+# negotiated/controller status for diagnostics without reapplying or gating recovery.
 # CONN_INTERVAL_MS=1000
 
 # InfluxDB Configuration
-INFLUXDB_URL=http://10.0.25.10:8086
+INFLUXDB_URL=<broker-url>
 INFLUXDB_TOKEN=your_token_here
 INFLUXDB_ORG=home
 INFLUXDB_BUCKET=sprinkler
@@ -159,70 +158,30 @@ zone is idle, `0` for standby, `2` for a scheduled-watering reminder, and `5`,
 The device maps the zone name `grass` to zone 2 and anything else to zone 1, so
 the name must be exactly `grass` or `garden` — a typo silently targets zone 1.
 
-## Connection Resilience Escalation Ladder
+## Connection Recovery
 
-The connection supervisor escalates through a ladder of recovery actions as
-connection-setup failures accumulate. The ladder is pure decision logic
-(`src/resilience.rs`); the actual recovery actions are performed by a
-`ResilienceController` (`src/dbus_control.rs`, `src/reboot.rs`).
+Normal connection failures use only exponential backoff (1s → 60s cap). The
+process creates one `SharedAdapter` in `run_app` and reuses it across MQTT
+instance restarts. After five consecutive failed acquisitions, the supervisor
+runs bounded Peripheral cleanup, clears the cached Adapter, and calls
+`setup_central` / `Manager::new()` once more to reinitialize the normal BLE
+session. A successful setup resets the failure count. MQTT instance cancellation
+and guard shutdown also run the same bounded, exactly-once cleanup.
 
-### Thresholds and rungs
+There is no legacy escalation ladder: normal failures do not power-cycle the
+BLE adapter, write the BlueZ `Powered` property, reboot the host, or persist
+ladder state.
 
-| Rung | Trigger | Action |
-|------|---------|--------|
-| 1 | First failures | Keep retrying with exponential backoff (1s → 60s cap). |
-| 2 | **5 consecutive failures within a rolling 10-minute window** | **Power-cycle the BLE adapter** via D-Bus (`Powered=false`, 1s delay, `Powered=true`). Rate-limited to once per 15 minutes. |
-| 3 | **15 consecutive failures** (5 + 10) after a power-cycle has been attempted | **Reboot the host** via `reboot(2)` (`RB_AUTOBOOT`). Rate-limited to once per 30 minutes, max 3 reboots per 24 hours. |
-| 4 | 24h reboot cap (3) reached | Stop escalating; keep retrying with backoff. |
+### HCI monitoring
 
-A successful connection resets the consecutive-failure counter and the failure
-window. Every rung transition and rate-limit skip is logged at `error`/`warn`
-with the current failure count.
-
-### State file
-
-Escalation state is persisted durably (write + flush + `fsync`, including the
-directory) so it survives a reboot and is loaded on startup before any
-escalation decision:
-
-```
-/var/lib/rshunterbtt/<device_name>-resilience-state.json
-```
-
-Format (pretty-printed JSON):
-
-```json
-{
-  "last_power_cycle_at": "2026-01-01T00:00:00Z",
-  "reboot_timestamps": ["2026-01-01T00:00:00Z"]
-}
-```
-
-- `last_power_cycle_at`: timestamp of the most recent adapter power-cycle.
-- `reboot_timestamps`: list of host reboot timestamps; entries older than 24h
-  are pruned on load and on each failure evaluation.
+`src/hci_monitor.rs` is spawned once for process lifetime. It logs HCI
+disconnection and controller status events, including `0x2005`, for diagnostics.
+It does not use HCI status to gate or restart connection recovery.
 
 ### Required host permissions
 
-- **Root** for D-Bus adapter control (`Powered` property on `org.bluez`) and
-  for `reboot(2)`.
 - **`CAP_NET_ADMIN`** (i.e. run as root) for the raw HCI sockets used to request
-  the connection interval and to run the interval guard — the monitor decodes
-  `LE Connection Update Complete` events and re-applies the configured interval
-  when the peripheral re-negotiates it away.
-
-### Resetting the rate-limit state manually
-
-To reset the escalation state (e.g. for testing), delete the state file and
-restart the service:
-
-```bash
-rm -f /var/lib/rshunterbtt/<device_name>-resilience-state.json
-rc-service rshunterbtt restart
-```
-
-The supervisor will start from a clean state (no pending power-cycle or reboot
-rate limits).
+  the configured connection interval and to monitor controller events.
 
 ## Development
 
@@ -250,10 +209,9 @@ The request is scoped to the bridge's own connection (the HCI handle is
 resolved from `DEVICE_ADDRESS`), so sharing an adapter with other BLE devices
 is safe.
 
-The Hunter BTT peripheral re-negotiates the interval back towards ~50ms shortly
-after connecting (and intermittently afterwards), which BlueZ honours. The
-interval guard watches the controller's event stream and re-applies the
-configured value whenever the peripheral pulls the interval away from target.
+The process-lifetime HCI monitor logs negotiated interval and controller status
+events for diagnostics only. It does not reapply interval changes or use HCI
+status to gate or restart BLE recovery.
 
 1. Copy the cross-compiled binary to `/root/rshunterbtt/rshunterbtt`.
 2. Create `/root/rshunterbtt/.env` with the correct device settings.

@@ -80,6 +80,7 @@ mod tests {
         std::env::set_var("INFLUXDB_BUCKET", "bucket");
         // Optional vars: start each test from a known state.
         std::env::remove_var("CONN_INTERVAL_MS");
+        std::env::remove_var("DEFAULT_RUN_SECONDS");
     }
 
     #[test]

@@ -1,16 +1,14 @@
 #[cfg(test)]
 mod tests {
+    use crate::ble::SharedAdapter;
     use crate::config::Config;
     use crate::protocol::{Second82Protocol, Second83Protocol};
-    use crate::resilience::{ResilienceLadder, ResilienceStateStore};
-    use crate::traits::{
-        MockBleClient, MockDatabaseWriter, MockMqttClient, MockResilienceController,
-    };
+    use crate::traits::{MockBleClient, MockDatabaseWriter, MockMqttClient};
     use crate::App;
     use crate::{
-        handle_connection_failure, next_backoff, run_battery_polling_loop,
-        run_connection_supervisor, run_valve_event_observer, BatteryPollingGuard,
-        BatteryPollingIntervals, StatusCacheSender, ZoneNamesCacheSender, INITIAL_BACKOFF,
+        next_backoff, run_battery_polling_loop, run_connection_supervisor,
+        run_valve_event_observer, BatteryPollingGuard, BatteryPollingIntervals, CleanupGate,
+        ConnectionGuard, StatusCacheSender, ZoneNamesCacheSender, INITIAL_BACKOFF,
     };
     use anyhow::anyhow;
     use mockall::predicate;
@@ -630,6 +628,163 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_guard_drop_disconnects_exactly_once() {
+        let mut ble = MockBleClient::new();
+        let disconnect_count = Arc::new(AtomicUsize::new(0));
+        let dc = disconnect_count.clone();
+        ble.expect_disconnect().times(1).returning(move || {
+            dc.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        let ble = Arc::new(ble);
+
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let supervisor_task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let guard = ConnectionGuard {
+            stop_tx,
+            ble_client: ble,
+            cleanup_gate: CleanupGate::default(),
+            task: Some(supervisor_task),
+        };
+
+        drop(guard);
+        wait_until(|| disconnect_count.load(Ordering::SeqCst) == 1).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(disconnect_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_supervisor_clears_shared_adapter_at_fifth_failure() {
+        let mut ble = MockBleClient::new();
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let disconnect_count = Arc::new(AtomicUsize::new(0));
+        let cc = connect_count.clone();
+        ble.expect_connect().times(1).returning(move |_| {
+            cc.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(anyhow!("simulated connection setup failure")) })
+        });
+        let dc = disconnect_count.clone();
+        ble.expect_disconnect().times(1).returning(move || {
+            dc.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+
+        let shared_adapter = SharedAdapter::default();
+        {
+            let mut slot = shared_adapter
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            slot.set_scan_active(true);
+            for _ in 0..4 {
+                assert!(!slot.record_acquisition_failure());
+            }
+            assert_eq!(slot.failed_acquisitions(), 4);
+        }
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (ready_tx, _ready_rx) = watch::channel(false);
+        let (status_tx, _status_rx) = watch::channel(None);
+        let (zone_names_tx, _zone_names_rx) = watch::channel(None);
+
+        let supervisor = tokio::spawn(run_connection_supervisor(
+            Arc::new(ble),
+            mock_config(),
+            stop_rx,
+            ready_tx,
+            status_tx,
+            zone_names_tx,
+            shared_adapter.clone(),
+            CleanupGate::default(),
+        ));
+
+        wait_until(|| {
+            let slot = shared_adapter
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            connect_count.load(Ordering::SeqCst) == 1
+                && disconnect_count.load(Ordering::SeqCst) == 1
+                && !slot.is_scan_active()
+                && slot.failed_acquisitions() == 0
+        })
+        .await;
+
+        let _ = stop_tx.send(true);
+        supervisor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_supervisor_success_resets_shared_adapter_failures() {
+        let mut ble = MockBleClient::new();
+        ble.expect_connect()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(()) }));
+        ble.expect_write_password()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(()) }));
+        ble.expect_subscribe_notifications()
+            .times(1)
+            .returning(|_| {
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                Box::pin(async move { Ok(rx) })
+            });
+        ble.expect_read_zone1_name()
+            .times(1)
+            .returning(|| Box::pin(async { Ok("Zone 1".to_string()) }));
+        ble.expect_read_zone2_name()
+            .times(1)
+            .returning(|| Box::pin(async { Ok("Zone 2".to_string()) }));
+        ble.expect_is_connected()
+            .times(1)
+            .returning(|| Box::pin(async { true }));
+        ble.expect_disconnect()
+            .times(1)
+            .returning(|| Box::pin(async { Ok(()) }));
+
+        let shared_adapter = SharedAdapter::default();
+        {
+            let mut slot = shared_adapter
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for _ in 0..4 {
+                assert!(!slot.record_acquisition_failure());
+            }
+            assert_eq!(slot.failed_acquisitions(), 4);
+        }
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let (status_tx, _status_rx) = watch::channel(None);
+        let (zone_names_tx, _zone_names_rx) = watch::channel(None);
+
+        let supervisor = tokio::spawn(run_connection_supervisor(
+            Arc::new(ble),
+            mock_config(),
+            stop_rx,
+            ready_tx,
+            status_tx,
+            zone_names_tx,
+            shared_adapter.clone(),
+            CleanupGate::default(),
+        ));
+
+        wait_until(|| {
+            *ready_rx.borrow() && {
+                shared_adapter
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .failed_acquisitions()
+                    == 0
+            }
+        })
+        .await;
+
+        let _ = stop_tx.send(true);
+        supervisor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_connection_supervisor_reconnects_after_disconnect() {
         let mut ble = MockBleClient::new();
         let mqtt = MockMqttClient::new();
@@ -704,12 +859,6 @@ mod tests {
 
         let supervisor_ble = ble.clone();
         let supervisor_config = config;
-        let controller = Arc::new(MockResilienceController::new());
-        let store = ResilienceStateStore::with_path(std::env::temp_dir().join(format!(
-            "rshunterbtt-sup-{}-{}.json",
-            std::process::id(),
-            connect_count.load(Ordering::SeqCst)
-        )));
         tokio::spawn(run_connection_supervisor(
             supervisor_ble,
             supervisor_config,
@@ -717,8 +866,8 @@ mod tests {
             ready_tx,
             status_tx,
             zone_names_tx,
-            controller,
-            store,
+            SharedAdapter::default(),
+            CleanupGate::default(),
         ));
 
         wait_until(|| connect_count.load(Ordering::SeqCst) >= 1 && *ready_check.borrow()).await;
@@ -750,118 +899,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    fn temp_state_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("rshunterbtt-{}-{}.json", name, std::process::id()))
-    }
-
-    #[tokio::test]
-    async fn test_ladder_power_cycles_once_then_rate_limited() {
-        let mut controller = MockResilienceController::new();
-        let power_cycle_count = Arc::new(AtomicUsize::new(0));
-        let pc = power_cycle_count.clone();
-        controller.expect_power_cycle_adapter().returning(move || {
-            pc.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
-        });
-        controller
-            .expect_reboot_host()
-            .returning(|| Box::pin(async { Ok(()) }));
-
-        let path = temp_state_path("powercycle");
-        let store = ResilienceStateStore::with_path(&path);
-        let mut ladder = ResilienceLadder::new();
-        let err = anyhow!("connect failed");
-
-        for _ in 0..5 {
-            handle_connection_failure(
-                &mut ladder,
-                &controller,
-                &store,
-                &err,
-                Duration::from_secs(1),
-            )
-            .await;
-        }
-        assert_eq!(
-            power_cycle_count.load(Ordering::SeqCst),
-            1,
-            "exactly one power cycle after 5 consecutive failures"
-        );
-
-        // 6th failure occurs within the power-cycle rate-limit window -> no 2nd call.
-        handle_connection_failure(
-            &mut ladder,
-            &controller,
-            &store,
-            &err,
-            Duration::from_secs(1),
-        )
-        .await;
-        assert_eq!(
-            power_cycle_count.load(Ordering::SeqCst),
-            1,
-            "6th failure within rate-limit window must not power cycle again"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn test_ladder_reboots_after_15_failures_and_persists() {
-        let mut controller = MockResilienceController::new();
-        let reboot_count = Arc::new(AtomicUsize::new(0));
-        let rc = reboot_count.clone();
-        controller.expect_reboot_host().returning(move || {
-            rc.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
-        });
-        controller
-            .expect_power_cycle_adapter()
-            .returning(|| Box::pin(async { Ok(()) }));
-
-        let path = temp_state_path("reboot");
-        let store = ResilienceStateStore::with_path(&path);
-        let mut ladder = ResilienceLadder::new();
-        let err = anyhow!("connect failed");
-
-        for _ in 0..15 {
-            handle_connection_failure(
-                &mut ladder,
-                &controller,
-                &store,
-                &err,
-                Duration::from_secs(1),
-            )
-            .await;
-        }
-        assert_eq!(
-            reboot_count.load(Ordering::SeqCst),
-            1,
-            "reboot after 15 failures"
-        );
-
-        // State must be persisted (write+flush+fsync) before the reboot.
-        let loaded = store.load().unwrap();
-        assert_eq!(
-            loaded.reboot_timestamps.len(),
-            1,
-            "reboot timestamp persisted"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    fn temp_zone_state_path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "rshunterbtt-zone-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
-
     fn spawn_supervisor_with_zone_names(
         ble: Arc<MockBleClient>,
         config: Config,
@@ -870,8 +907,6 @@ mod tests {
         zone_names_tx: ZoneNamesCacheSender,
     ) -> watch::Sender<bool> {
         let (stop_tx, stop_rx) = watch::channel(false);
-        let controller = Arc::new(MockResilienceController::new());
-        let store = ResilienceStateStore::with_path(temp_zone_state_path());
         tokio::spawn(run_connection_supervisor(
             ble,
             config,
@@ -879,8 +914,8 @@ mod tests {
             ready_tx,
             status_tx,
             zone_names_tx,
-            controller,
-            store,
+            SharedAdapter::default(),
+            CleanupGate::default(),
         ));
         stop_tx
     }

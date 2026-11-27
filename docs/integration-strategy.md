@@ -95,7 +95,7 @@ interval, and recovers via re-subscription. See [architecture](architecture.md).
 
 1. **Fix the byte-offset bug** (read zone state at bytes 10/11) — concrete correctness fix, independent of architecture. **[OBSERVED, confirmed by live status payload]**
 2. **Adopt the persistent + notification architecture (D)** — device holds a connection, pushes `ff82` state changes, accepts 4000ms interval. Battery is an out-of-scope non-functional requirement — observe over time in production.
-3. **Handle host controller resilience** — the Pi BCM43430A1 gets into a bad state (HCI EBUSY, abort-by-local); a full reboot clears it. Add controller-reset-on-error (prove the causal chain with btmon first).
+3. **Observe host controller status** — log HCI EBUSY/abort-by-local events and keep normal recovery limited to SharedAdapter reinitialization and MQTT/connection backoff; do not power-cycle or reboot based on these normal failures.
 4. **Re-subscribe on reconnect** — the `ff82` subscription must be recreated after a connection drop (validated).
 
 ## 6. What would falsify the recommendation
@@ -157,7 +157,7 @@ Initiator:       <central/peripheral>
 
 **Dependency chain (no premature optimisation):** 1 idle survival → 2 notification behaviour → 2A notification-without-polling → 3 connection parameters → 4 reconnection → 5 battery.
 
-**On the proposed controller reset:** `hciconfig hci0 reset` (or a bluez power-cycle) is a plausible mitigation, but **do not put it into production code yet**. First prove the causal chain with `btmon`: connection attempt → controller enters bad state → 0x2005 EBUSY → reset → controller healthy → connection succeeds. Only then add it to the reconnect path.
+**On controller 0x2005:** keep it observable with the process-lifetime HCI monitor, but do not add host reboot, adapter power-cycle, or `hciconfig hci0 reset` to the reconnect path. Normal failures remain backoff/retry plus SharedAdapter reinitialization.
 
 ---
 
