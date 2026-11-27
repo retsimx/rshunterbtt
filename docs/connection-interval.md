@@ -1,7 +1,7 @@
-# BLE connection interval: latency, the peripheral's re-negotiation, and enforcement
+# BLE connection interval: latency, the peripheral's re-negotiation, and diagnostics
 
 **Status**: deployed (2026-09-17) — `CONN_INTERVAL_MS=1000` on all 3 hosts,
-with an event-driven interval guard.
+with a process-lifetime HCI diagnostic monitor.
 **Scope**: `rshunterbtt` (`src/hci.rs`, `src/hci_monitor.rs`, `src/lib.rs`).
 
 Relates to: [architecture](architecture.md) (persistent connection model),
@@ -19,7 +19,8 @@ trade-off. Two things make it non-trivial, both established empirically:
    connecting, and intermittently later. BlueZ honours the peripheral, silently
    reverting the bridge's requested interval.
 2. Because of (1), the requested interval is often **not** what the link is
-   actually running at, so the bridge must both re-apply it and keep watching.
+   actually running at, so the bridge requests it at setup and keeps observing
+   negotiated interval/controller events diagnostically.
 
 ## Empirical latency data (2026-09-17, stop command = 3 GATT ops)
 
@@ -53,18 +54,18 @@ LE Connection Update Complete   -> 48.75 ms    (BlueZ honours it -> revert)
 So a `negotiated 1000ms` log line can be immediately followed by a silent
 revert. Latency — not the log line — is the source of truth.
 
-## The fix
+## Runtime behavior
 
-The peripheral sends its request shortly after connecting; the bridge relies on
-a single mechanism to hold the interval — an event-driven guard that catches
-the re-negotiation and re-applies the configured value.
+The bridge requests the configured interval during connection setup. The
+peripheral may subsequently re-negotiate that interval, so the effective link
+latency may differ from the requested value.
 
-### Event-driven interval guard (`hci_monitor`)
+### HCI diagnostic monitor (`hci_monitor`)
 
-The bridge opens an `HCI_CHANNEL_MONITOR` socket, decodes
-`LE Connection Update Complete` events, and whenever the reported interval is
-off-target it re-applies the configured interval (rate-limited to 1 per 3 s,
-on its own thread so the monitor loop never stalls).
+The bridge opens an `HCI_CHANNEL_MONITOR` socket and decodes
+`LE Connection Update Complete`, disconnection, and selected controller command
+status events. It logs controller status (including `0x2005`) but never sends
+an HCI re-apply command and never uses HCI status to gate or restart recovery.
 
 **Kernel encoding (verified against source, not memory):**
 - Channel enum is **not stable across trees**. This Raspberry Pi 6.12.y kernel
@@ -74,42 +75,39 @@ on its own thread so the monitor loop never stalls).
 - Monitor packet types (`include/net/bluetooth/hci_mon.h`):
   `COMMAND_PKT=2, EVENT_PKT=3, ACL_TX=4, ACL_RX=5` (18/19 are ISO).
 
-### Proven behaviour (fresh reboots, all 3 hosts)
+### Observed behavior (fresh reboots, all 3 hosts)
+
+The initial request and negotiated interval can differ. Capture event lines for
+diagnostic evidence; do not interpret HCI monitoring as a corrective recovery
+loop.
 
 ```
-HCI monitor active: interval guard watching for re-negotiation (target 1000ms)
-interval changed to 60ms (target 1000ms); re-applying
-connection interval updated: requested 1000ms, negotiated 1000ms
+HCI monitor active: diagnostic controller logging (target interval 1000ms)
+HCI connection update complete: handle 64 interval 48ms status 0x00
 ```
 
-| Host | Reverts detected → corrected | Effective latency |
-|---|---|---|
-| host A | 60 ms, 50 ms | 5.52–5.54 s |
-| host B | 198 ms, 60 ms | (1000 ms held) |
-| host C | 200 ms | (1000 ms held) |
-
-Corrections settle (typically 1–2 per connection); no ping-pong observed.
+Effective latency remains a property of the negotiated peripheral/BlueZ link,
+not a command-driven re-apply performed by `hci_monitor`.
 
 ## Configuration
 
 - **`CONN_INTERVAL_MS`** (default `4000`, BLE range 8–4000). The bridge requests
-  it (with retry) and the guard re-asserts it on every revert. This is the only
-  knob: the interval is set per connection at runtime.
+  it (with retry) during connection setup. The HCI monitor only records resulting
+  negotiated/controller events; it does not re-assert the interval.
 
 ## Deployment decision
 
 **1000 ms** on all 3 hosts. It gives ~5.2–5.7 s command latency at **4× fewer
 connection events than 4000 ms and 16× fewer than the OEM's 60 ms**. The
-peripheral actively wants ~48–60 ms; the guard holds 1000 ms against it, so
-the battery benefit is real (not silently lost to a revert). If battery
-regresses, raise the interval; if 5 s is too slow, lower it.
+peripheral may still re-negotiate toward ~48–60 ms, and the monitor records the
+actual link for diagnostics. If battery regresses, raise the requested interval;
+if 5 s is too slow, lower it.
 The HA `valve` entities remain `optimistic` so the UI is instant regardless.
 
 ## Open items
 
 - Battery: observe `sprinkler.battery` over the coming weeks at 1000 ms.
-- The guard only decodes `LE Connection Update Complete`; it does not filter by
-  handle, so a *different* connected device's parameter change can trigger a
-  (harmless, idempotent) re-apply of the configured interval.
+- The HCI monitor decodes `LE Connection Update Complete` events for diagnostics
+  and does not filter or gate recovery by connection handle.
 - Channel enum is kernel-specific (see above); a kernel change on these hosts
   would require updating `HCI_CHANNEL_MONITOR`.

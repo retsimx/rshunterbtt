@@ -5,6 +5,8 @@ use btleplug::api::{
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -16,22 +18,121 @@ use crate::protocol::{
 };
 use crate::traits::BleClient;
 
+pub const MAX_FAILED_ACQUISITIONS: u32 = 5;
+pub(crate) const BLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+pub fn should_reinit(failed_acquisitions: u32) -> bool {
+    failed_acquisitions >= MAX_FAILED_ACQUISITIONS
+}
+
+#[derive(Default)]
+pub struct AdapterSlot {
+    adapter: Option<Adapter>,
+    scan_active: bool,
+    failed_acquisitions: u32,
+}
+
+impl AdapterSlot {
+    pub fn clear(&mut self) {
+        self.adapter = None;
+        self.scan_active = false;
+        self.failed_acquisitions = 0;
+    }
+
+    pub fn is_scan_active(&self) -> bool {
+        self.scan_active
+    }
+
+    pub fn set_scan_active(&mut self, active: bool) {
+        self.scan_active = active;
+    }
+
+    pub fn clear_scan_active_if_set(&mut self) -> bool {
+        if !self.scan_active {
+            return false;
+        }
+        self.scan_active = false;
+        true
+    }
+
+    pub fn failed_acquisitions(&self) -> u32 {
+        self.failed_acquisitions
+    }
+
+    pub fn record_acquisition_failure(&mut self) -> bool {
+        self.failed_acquisitions = self.failed_acquisitions.saturating_add(1);
+        should_reinit(self.failed_acquisitions)
+    }
+
+    pub fn record_acquisition_success(&mut self) {
+        self.failed_acquisitions = 0;
+    }
+}
+
+pub type SharedAdapter = Arc<Mutex<AdapterSlot>>;
+
+fn lock_slot(shared: &SharedAdapter) -> MutexGuard<'_, AdapterSlot> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+async fn take_stored<T>(stored: &tokio::sync::Mutex<Option<T>>) -> Option<T> {
+    stored.lock().await.take()
+}
+
+pub async fn setup_central(shared: &SharedAdapter) -> Result<Adapter> {
+    if let Some(central) = lock_slot(shared).adapter.clone() {
+        return Ok(central);
+    }
+
+    let manager = Manager::new().await?;
+    let central = manager
+        .adapters()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("No adapters found"))?;
+    lock_slot(shared).adapter = Some(central.clone());
+    Ok(central)
+}
+
+pub async fn stop_scan_if_active(central: &Adapter, shared: &SharedAdapter) {
+    if !lock_slot(shared).clear_scan_active_if_set() {
+        return;
+    }
+    match time::timeout(BLE_CLEANUP_TIMEOUT, central.stop_scan()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Failed to stop BLE scan: {}", e),
+        Err(_) => warn!(
+            "Timed out stopping BLE scan after {}s",
+            BLE_CLEANUP_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+async fn bounded_disconnect_peripheral(peripheral: Peripheral) {
+    match time::timeout(BLE_CLEANUP_TIMEOUT, peripheral.disconnect()).await {
+        Ok(Ok(())) => debug!("BLE peripheral disconnected"),
+        Ok(Err(e)) => debug!("BLE peripheral disconnect returned error (ignored): {}", e),
+        Err(_) => warn!(
+            "Timed out disconnecting BLE peripheral after {}s",
+            BLE_CLEANUP_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 pub struct BtleplugClient {
-    central: Adapter,
+    shared_adapter: SharedAdapter,
     peripheral: tokio::sync::Mutex<Option<Peripheral>>,
+    cleanup_started: AtomicBool,
 }
 
 impl BtleplugClient {
-    pub async fn new() -> Result<Self> {
-        let manager = Manager::new().await?;
-        let adapters = manager.adapters().await?;
-        let central = adapters
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("No adapters found"))?;
+    pub async fn new(shared_adapter: SharedAdapter) -> Result<Self> {
+        setup_central(&shared_adapter).await?;
         Ok(Self {
-            central,
+            shared_adapter,
             peripheral: tokio::sync::Mutex::new(None),
+            cleanup_started: AtomicBool::new(false),
         })
     }
 
@@ -41,6 +142,10 @@ impl BtleplugClient {
             .await
             .clone()
             .ok_or_else(|| anyhow!("Not connected"))
+    }
+
+    async fn take_peripheral(&self) -> Option<Peripheral> {
+        take_stored(&self.peripheral).await
     }
 
     async fn find_characteristic(
@@ -63,8 +168,12 @@ impl BtleplugClient {
 #[async_trait]
 impl BleClient for BtleplugClient {
     async fn connect(&self, address: &str) -> Result<()> {
+        let central = setup_central(&self.shared_adapter).await?;
+        stop_scan_if_active(&central, &self.shared_adapter).await;
+
         info!("Starting BLE scan for {}...", address);
-        match self.central.start_scan(ScanFilter::default()).await {
+        lock_slot(&self.shared_adapter).set_scan_active(true);
+        match central.start_scan(ScanFilter::default()).await {
             Ok(_) => debug!("Scan started successfully"),
             Err(e) => {
                 let err_msg = format!("{:?}", e);
@@ -77,31 +186,51 @@ impl BleClient for BtleplugClient {
                         err_msg
                     );
                 } else {
+                    lock_slot(&self.shared_adapter).set_scan_active(false);
                     return Err(anyhow!("Scan error: {}", err_msg));
                 }
             }
         }
 
         time::sleep(Duration::from_secs(10)).await;
+        stop_scan_if_active(&central, &self.shared_adapter).await;
 
-        let peripherals_res = self.central.peripherals().await;
-        if let Err(e) = self.central.stop_scan().await {
-            warn!("Failed to stop BLE scan: {}", e);
-        }
-        let peripherals = peripherals_res?;
+        let peripherals_res = central.peripherals().await;
+        stop_scan_if_active(&central, &self.shared_adapter).await;
+        let peripherals = match peripherals_res {
+            Ok(peripherals) => peripherals,
+            Err(e) => return Err(anyhow!("Peripheral enumeration error: {}", e)),
+        };
+
         for p in peripherals {
             if p.address().to_string() == address {
+                stop_scan_if_active(&central, &self.shared_adapter).await;
                 info!("Found device {}, connecting...", address);
-                p.connect().await?;
+                if let Err(e) = p.connect().await {
+                    stop_scan_if_active(&central, &self.shared_adapter).await;
+                    return Err(anyhow!("Connect error: {}", e));
+                }
+                stop_scan_if_active(&central, &self.shared_adapter).await;
+
                 info!("Connected to {}. Discovering services...", address);
-                p.discover_services().await?;
+                if let Err(e) = p.discover_services().await {
+                    stop_scan_if_active(&central, &self.shared_adapter).await;
+                    return Err(anyhow!("Service discovery error: {}", e));
+                }
+                stop_scan_if_active(&central, &self.shared_adapter).await;
+
                 info!("Services discovered for {}.", address);
+                if let Some(old_peripheral) = take_stored(&self.peripheral).await {
+                    bounded_disconnect_peripheral(old_peripheral).await;
+                }
                 let mut lock = self.peripheral.lock().await;
                 *lock = Some(p);
+                self.cleanup_started.store(false, Ordering::Release);
                 return Ok(());
             }
         }
 
+        stop_scan_if_active(&central, &self.shared_adapter).await;
         Err(anyhow!("Device {} not found", address))
     }
 
@@ -114,12 +243,28 @@ impl BleClient for BtleplugClient {
     }
 
     async fn disconnect(&self) -> Result<()> {
-        let mut lock = self.peripheral.lock().await;
-        if let Some(p) = lock.take() {
-            if let Err(e) = p.disconnect().await {
-                debug!("disconnect returned error (ignored): {}", e);
+        if self.cleanup_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let peripheral = self.take_peripheral().await;
+        let scan_active = lock_slot(&self.shared_adapter).is_scan_active();
+
+        if peripheral.is_some() || scan_active {
+            match time::timeout(BLE_CLEANUP_TIMEOUT, setup_central(&self.shared_adapter)).await {
+                Ok(Ok(central)) => stop_scan_if_active(&central, &self.shared_adapter).await,
+                Ok(Err(e)) => debug!("Unable to obtain BLE adapter for cleanup: {}", e),
+                Err(_) => warn!(
+                    "Timed out obtaining BLE adapter for cleanup after {}s",
+                    BLE_CLEANUP_TIMEOUT.as_secs()
+                ),
             }
         }
+
+        if let Some(peripheral) = peripheral {
+            bounded_disconnect_peripheral(peripheral).await;
+        }
+
         Ok(())
     }
 
@@ -240,5 +385,121 @@ impl BleClient for BtleplugClient {
             }
         });
         Ok(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stored_peripheral_slot_is_taken_exactly_once() {
+        let stored = tokio::sync::Mutex::new(Some(42_u8));
+
+        assert_eq!(take_stored(&stored).await, Some(42));
+        assert_eq!(take_stored(&stored).await, None);
+    }
+
+    #[test]
+    fn adapter_slot_defaults_to_empty_and_inactive() {
+        let slot = AdapterSlot::default();
+        assert!(slot.adapter.is_none());
+        assert!(!slot.is_scan_active());
+        assert_eq!(slot.failed_acquisitions(), 0);
+    }
+
+    #[test]
+    fn adapter_slot_tracks_scan_active_and_clear_resets_state() {
+        let mut slot = AdapterSlot::default();
+        slot.set_scan_active(true);
+        assert!(slot.is_scan_active());
+
+        slot.record_acquisition_failure();
+        assert_eq!(slot.failed_acquisitions(), 1);
+
+        slot.set_scan_active(false);
+        assert!(!slot.is_scan_active());
+
+        slot.set_scan_active(true);
+        slot.clear();
+        assert!(slot.adapter.is_none());
+        assert!(!slot.is_scan_active());
+        assert_eq!(slot.failed_acquisitions(), 0);
+    }
+
+    #[test]
+    fn abort_mid_sleep_preserves_scan_active_until_next_connect_cleanup() {
+        let shared = SharedAdapter::default();
+        {
+            let mut slot = lock_slot(&shared);
+            slot.set_scan_active(true);
+        }
+
+        // Simulate ConnectionGuard::drop aborting mid-sleep: no cleanup call runs.
+        assert!(lock_slot(&shared).is_scan_active());
+
+        let stopped = lock_slot(&shared).clear_scan_active_if_set();
+        assert!(stopped, "next connect cleanup must stop stale discovery");
+        assert!(!lock_slot(&shared).is_scan_active());
+    }
+
+    #[test]
+    fn five_failed_acquisitions_trigger_reinit_without_escalation() {
+        let mut slot = AdapterSlot::default();
+        slot.set_scan_active(true);
+        for failed in 1..MAX_FAILED_ACQUISITIONS {
+            assert!(!slot.record_acquisition_failure(), "reinit at {failed}");
+        }
+        assert!(slot.record_acquisition_failure());
+        assert_eq!(slot.failed_acquisitions(), MAX_FAILED_ACQUISITIONS);
+
+        slot.clear();
+        assert!(slot.adapter.is_none());
+        assert!(!slot.is_scan_active());
+        assert_eq!(slot.failed_acquisitions(), 0);
+    }
+
+    #[test]
+    fn success_resets_failed_acquisition_count() {
+        let mut slot = AdapterSlot::default();
+        for _ in 0..4 {
+            assert!(!slot.record_acquisition_failure());
+        }
+        assert_eq!(slot.failed_acquisitions(), 4);
+
+        slot.record_acquisition_success();
+        assert_eq!(slot.failed_acquisitions(), 0);
+
+        for failed in 1..=MAX_FAILED_ACQUISITIONS {
+            let should_reinit = slot.record_acquisition_failure();
+            assert_eq!(should_reinit, failed == MAX_FAILED_ACQUISITIONS);
+        }
+    }
+
+    #[test]
+    fn should_reinit_is_thresholded_at_five() {
+        assert!(!should_reinit(0));
+        assert!(!should_reinit(MAX_FAILED_ACQUISITIONS - 1));
+        assert!(should_reinit(MAX_FAILED_ACQUISITIONS));
+        assert!(should_reinit(MAX_FAILED_ACQUISITIONS + 1));
+    }
+
+    #[test]
+    fn lock_slot_recovers_from_poisoned_mutex() {
+        let shared = SharedAdapter::default();
+        let shared_for_panic = Arc::clone(&shared);
+        let result = std::thread::spawn(move || {
+            let mut guard = lock_slot(&shared_for_panic);
+            guard.set_scan_active(true);
+            panic!("simulated panic while holding AdapterSlot lock");
+        })
+        .join();
+        assert!(result.is_err());
+
+        let mut recovered = lock_slot(&shared);
+        assert!(recovered.is_scan_active());
+        recovered.clear();
+        assert!(!recovered.is_scan_active());
+        assert!(recovered.adapter.is_none());
     }
 }

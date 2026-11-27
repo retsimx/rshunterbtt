@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use std::os::unix::io::RawFd;
-use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 const AF_BLUETOOTH: i32 = 31;
@@ -23,10 +22,6 @@ const HCI_EVENT_COMMAND_STATUS: u8 = 0x0f;
 const HCI_EVENT_LE_META: u8 = 0x3e;
 const LE_SUBEVENT_CONNECTION_UPDATE_COMPLETE: u8 = 0x03;
 const LE_SET_RANDOM_ADDRESS: u16 = 0x2005;
-
-/// Minimum gap between our own corrective interval re-applies, so a peripheral
-/// that re-negotiates repeatedly can never spin us.
-const REAPPLY_MIN_GAP: Duration = Duration::from_secs(3);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -70,11 +65,11 @@ fn open_hci_monitor_socket() -> Result<RawFd> {
     Ok(fd)
 }
 
-/// State for the interval guard: the configured target and a rate-limit clock.
+/// Process-lifetime diagnostic context. This monitor observes HCI events but
+/// never sends controller commands or triggers connection, adapter, or host recovery.
 pub struct IntervalGuard {
     pub device_address: String,
     pub interval_ms: u16,
-    last_reapply: Instant,
 }
 
 impl IntervalGuard {
@@ -82,54 +77,7 @@ impl IntervalGuard {
         Self {
             device_address,
             interval_ms,
-            last_reapply: Instant::now() - REAPPLY_MIN_GAP,
         }
-    }
-
-    fn target_units(&self) -> u16 {
-        (self.interval_ms as u32 * 4 / 5) as u16
-    }
-
-    /// Decide whether a reported interval warrants a corrective re-apply:
-    /// off-target and outside the rate-limit window. Records the attempt time.
-    fn should_reapply(&mut self, actual_units: u16) -> bool {
-        if actual_units == self.target_units() {
-            return false;
-        }
-        if self.last_reapply.elapsed() < REAPPLY_MIN_GAP {
-            return false;
-        }
-        self.last_reapply = Instant::now();
-        true
-    }
-
-    /// The peripheral (or BlueZ) has re-negotiated the interval away from our
-    /// target. Re-assert it, rate-limited. The re-apply runs on its own thread
-    /// so a slow/blocking `request_interval` never stalls the monitor loop
-    /// (which would otherwise drop events).
-    fn enforce(&mut self, actual_units: u16) {
-        let actual_ms = actual_units as u32 * 5 / 4;
-        if !self.should_reapply(actual_units) {
-            debug!(
-                "interval now {}ms (target {}ms); not re-applying",
-                actual_ms, self.interval_ms
-            );
-            return;
-        }
-        let device_address = self.device_address.clone();
-        let interval_ms = self.interval_ms;
-        info!(
-            "interval changed to {}ms (target {}ms); re-applying",
-            actual_ms, interval_ms
-        );
-        std::thread::Builder::new()
-            .spawn(
-                move || match crate::hci::request_interval(&device_address, interval_ms) {
-                    Ok(()) => info!("interval re-apply complete"),
-                    Err(e) => warn!("interval re-apply failed: {}", e),
-                },
-            )
-            .ok();
     }
 }
 
@@ -150,13 +98,7 @@ fn decode_monitor_packet(data: &[u8], guard: &mut IntervalGuard) {
     }
 }
 
-/// Whether an `LE Connection Update Complete` for `event_handle` belongs to our
-/// connection. `own_handle` is `None` when our device is not connected.
-fn is_own_link(event_handle: u16, own_handle: Option<u16>) -> bool {
-    own_handle == Some(event_handle)
-}
-
-fn decode_hci_event(evt: &[u8], guard: &mut IntervalGuard) {
+fn decode_hci_event(evt: &[u8], _guard: &mut IntervalGuard) {
     if evt.len() < 2 {
         return;
     }
@@ -177,17 +119,15 @@ fn decode_hci_event(evt: &[u8], guard: &mut IntervalGuard) {
         }
         HCI_EVENT_LE_META if evt.len() >= 8 && evt[2] == LE_SUBEVENT_CONNECTION_UPDATE_COMPLETE => {
             // evt[3]=status, evt[4..6]=handle (LE), evt[6..8]=connection interval
+            let status = evt[3];
             let event_handle = u16::from_le_bytes([evt[4], evt[5]]);
             let interval = u16::from_le_bytes([evt[6], evt[7]]);
-            let own_handle = crate::hci::resolve_connection_handle(&guard.device_address).ok();
-            if is_own_link(event_handle, own_handle) {
-                guard.enforce(interval);
-            } else {
-                debug!(
-                    "ignoring interval event for handle {} (not our link)",
-                    event_handle
-                );
-            }
+            info!(
+                "HCI connection update complete: handle {} interval {}ms status 0x{:02x}",
+                event_handle,
+                interval as u32 * 5 / 4,
+                status
+            );
         }
         _ => {}
     }
@@ -212,17 +152,14 @@ fn run_monitor_loop(fd: RawFd, mut guard: IntervalGuard) {
     unsafe { libc::close(fd) };
 }
 
-/// Watch the HCI event stream and keep the connection interval pinned to the
-/// configured value. The Hunter BTT peripheral re-negotiates the interval
-/// (L2CAP Connection Parameter Update Request) shortly after connecting and
-/// intermittently afterwards; BlueZ honours it, silently reverting our
-/// interval. On any `LE Connection Update Complete` that lands away from our
-/// target we re-apply it (rate-limited).
+/// Watch the HCI event stream for process-lifetime diagnostics. The monitor
+/// logs disconnections, selected controller command statuses (including
+/// `0x2005`), and connection-update events. It never sends HCI commands and
+/// never triggers connection, adapter, or host recovery.
 ///
-/// The socket is bound *synchronously* before returning, so the caller can
-/// guarantee the guard is active before issuing any interval update. Returns
-/// `true` if the monitor is bound and running. Diagnostic decoding from the
-/// original implementation is retained.
+/// The socket is bound synchronously before returning, so the caller knows
+/// whether monitoring is active. Returns `true` if the monitor is bound and
+/// running.
 pub fn spawn_hci_monitor(device_address: String, interval_ms: u16) -> bool {
     let guard = IntervalGuard::new(device_address, interval_ms);
     let fd = match open_hci_monitor_socket() {
@@ -235,7 +172,7 @@ pub fn spawn_hci_monitor(device_address: String, interval_ms: u16) -> bool {
     match std::thread::Builder::new().spawn(move || run_monitor_loop(fd, guard)) {
         Ok(_) => {
             info!(
-                "HCI monitor active: interval guard watching for re-negotiation (target {}ms)",
+                "HCI monitor active: diagnostic controller logging (target interval {}ms)",
                 interval_ms
             );
             true
@@ -290,16 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn test_is_own_link_filters_other_connections() {
-        assert!(is_own_link(64, Some(64)));
-        assert!(!is_own_link(65, Some(64)));
-        assert!(!is_own_link(64, None));
-    }
-
-    #[test]
-    fn test_connection_update_complete_decodes_and_enforces() {
+    fn test_connection_update_complete_is_diagnostic_only() {
         // LE Meta (0x3e), subevent Connection Update Complete (0x03),
-        // status 0, handle 64, interval 0x0320 (=1000ms -> equals target: no-op).
+        // status 0, handle 64, interval 0x0320 (=1000ms).
         let evt = [
             0x3eu8, 0x0c, 0x03, 0x00, 0x40, 0x00, 0x20, 0x03, 0x00, 0x00, 0xd0, 0x07,
         ];
@@ -307,43 +237,11 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_update_complete_to_fast_interval_triggers_enforce() {
-        // Link reverted to 0x0030 (=60ms) -> enforce() would call the HCI layer;
-        // here we only assert the decoder path runs without panicking for a
-        // non-target interval (the actual re-apply hits real HCI, so this test
-        // uses a target of 60ms to keep it a no-op).
+    fn test_fast_connection_update_is_logged_without_recovery_action() {
         let mut g = IntervalGuard::new("11:22:33:44:55:66".to_string(), 60);
         let evt = [
             0x3eu8, 0x0c, 0x03, 0x00, 0x40, 0x00, 0x30, 0x00, 0x00, 0x00, 0xd0, 0x07,
         ];
         decode_monitor_packet(&event_pkt(&evt), &mut g);
-    }
-
-    #[test]
-    fn test_should_reapply_only_when_off_target_and_outside_rate_limit() {
-        let mut g = IntervalGuard::new("11:22:33:44:55:66".to_string(), 1000);
-        let target_units = 800; // 1000ms
-        assert!(
-            !g.should_reapply(target_units),
-            "on-target interval must not trigger a re-apply"
-        );
-        assert!(
-            g.should_reapply(48),
-            "off-target interval must trigger a re-apply"
-        );
-        assert!(
-            !g.should_reapply(60),
-            "a second revert inside the rate-limit window must be deferred"
-        );
-    }
-
-    #[test]
-    fn test_target_units_conversion() {
-        let g = IntervalGuard::new("x".to_string(), 1000);
-        assert_eq!(g.target_units(), 800); // 1000ms / 1.25
-        let g = IntervalGuard::new("x".to_string(), 4000);
-        assert_eq!(g.target_units(), 3200);
-        let g = IntervalGuard::new("x".to_string(), 60);
-        assert_eq!(g.target_units(), 48);
     }
 }
