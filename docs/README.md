@@ -21,7 +21,7 @@ implement.
 - **[Architecture](architecture.md)** — the persistent-connection,
   notification-driven design and the findings that motivated it.
 - **[Connection interval](connection-interval.md)** — latency versus battery,
-  the peripheral's re-negotiation, and process-lifetime HCI diagnostics.
+  the peripheral's re-negotiation, and the interval guard.
 - **[Integration strategy](integration-strategy.md)** — the options considered
   for home-automation integration and the decision record.
 
